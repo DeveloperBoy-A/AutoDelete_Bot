@@ -1,0 +1,2 @@
+# Tokyo_Updates Auto-Delete Bot | Credits: Tokyo_Updates
+python-telegram-bot>=21.6,<23.0
