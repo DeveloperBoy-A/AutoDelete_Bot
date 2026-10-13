@@ -1,0 +1,747 @@
+# -*- coding: utf-8 -*-
+"""Tokyo_Updates Auto-Delete Bot | Credits: Tokyo_Updates
+No MongoDB needed: everything is stored in a local SQLite file.
+"""
+__credits__ = 'Tokyo_Updates'
+import asyncio
+import functools
+import html
+import logging
+import os
+import re
+import sqlite3
+import time
+from contextlib import closing
+
+from telegram import (BotCommand, BotCommandScopeChat, InlineKeyboardButton,
+                      InlineKeyboardMarkup, Update)
+from telegram.constants import ChatMemberStatus, ChatType, ParseMode
+from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.ext import (Application, CallbackQueryHandler, ChatMemberHandler,
+                          CommandHandler, ContextTypes, MessageHandler, filters)
+
+from info import (BOT_TOKEN, CHECK_INTERVAL, DB_PATH, DEFAULT_DELETE_SECONDS,
+                  LOG_CHANNEL, OWNER_IDS, START_PIC, START_PIC_LOCAL, UPDATES_URL)
+
+BRAND = 'ᴛᴏᴋʏᴏ_ᴜᴘᴅᴀᴛᴇs'
+CREDIT = 'ᴄʀᴇᴅɪᴛs: Tokyo_Updates'
+HTML = ParseMode.HTML
+GROUP_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP)
+AUTO_TYPES = GROUP_TYPES + (ChatType.CHANNEL,)   # chats where auto-delete works
+ANON_ADMIN_ID, CHANNEL_BOT_ID = 1087968824, 136817688
+TEMP_SECONDS = 60          # bot's own temporary replies in groups are deleted after this
+WARN_COOLDOWN = 20         # seconds between join-warnings for the same user in a chat
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(name)s | %(message)s')
+log = logging.getLogger('Tokyo_Updates.AutoDelete')
+
+
+# ───────────────────────── database ─────────────────────────
+def Tokyo_connect_db():
+    return sqlite3.connect(DB_PATH, timeout=30)
+
+
+def Tokyo_init_db():
+    parent = os.path.dirname(DB_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with closing(Tokyo_connect_db()) as db:
+        db.execute('PRAGMA journal_mode=WAL')
+        db.executescript('''
+        CREATE TABLE IF NOT EXISTS settings(chat_id INTEGER PRIMARY KEY, seconds INTEGER NOT NULL, fsub INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS pending(chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, delete_at INTEGER NOT NULL, PRIMARY KEY(chat_id, message_id));
+        CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS fsub_channels(channel_id INTEGER PRIMARY KEY, title TEXT, username TEXT, link TEXT);
+        CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY, name TEXT, username TEXT, first_seen INTEGER, last_seen INTEGER);
+        CREATE TABLE IF NOT EXISTS chats(chat_id INTEGER PRIMARY KEY, title TEXT, username TEXT, type TEXT, added_by INTEGER, added_by_name TEXT, added_at INTEGER, active INTEGER NOT NULL DEFAULT 1);
+        CREATE INDEX IF NOT EXISTS pending_due ON pending(delete_at);
+        ''')
+        db.commit()
+
+
+def Tokyo_get_config(key, default=None):
+    with closing(Tokyo_connect_db()) as db:
+        row = db.execute('SELECT value FROM config WHERE key=?', (key,)).fetchone()
+    return row[0] if row else default
+
+
+def Tokyo_set_config(key, value):
+    with closing(Tokyo_connect_db()) as db:
+        if value is None:
+            db.execute('DELETE FROM config WHERE key=?', (key,))
+        else:
+            db.execute('INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, str(value)))
+        db.commit()
+
+
+def Tokyo_get_seconds(chat_id, is_channel=False):
+    """Delete delay in seconds. 0 = OFF. Channels stay OFF until an admin runs /set_time (safe default)."""
+    with closing(Tokyo_connect_db()) as db:
+        row = db.execute('SELECT seconds FROM settings WHERE chat_id=?', (chat_id,)).fetchone()
+    if row:
+        return row[0]
+    return 0 if is_channel else DEFAULT_DELETE_SECONDS
+
+
+def Tokyo_set_seconds(chat_id, seconds):
+    with closing(Tokyo_connect_db()) as db:
+        db.execute('INSERT INTO settings(chat_id,seconds) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET seconds=excluded.seconds', (chat_id, seconds))
+        db.commit()
+
+
+def Tokyo_fsub_enabled():
+    return Tokyo_get_config('fsub_enabled', '0') == '1'
+
+
+def Tokyo_get_fsub_channels():
+    with closing(Tokyo_connect_db()) as db:
+        rows = db.execute('SELECT channel_id,title,username,link FROM fsub_channels ORDER BY rowid').fetchall()
+    return [{'id': r[0], 'title': r[1], 'username': r[2], 'link': r[3]} for r in rows]
+
+
+def Tokyo_get_log_channel():
+    value = Tokyo_get_config('log_channel')
+    if value and value.lstrip('-').isdigit():
+        return int(value)
+    return LOG_CHANNEL or 0
+
+
+def Tokyo_schedule_delete(chat_id, message_id, seconds):
+    with closing(Tokyo_connect_db()) as db:
+        db.execute('INSERT OR REPLACE INTO pending(chat_id,message_id,delete_at) VALUES(?,?,?)', (chat_id, message_id, int(time.time()) + int(seconds)))
+        db.commit()
+
+
+def Tokyo_upsert_user(user):
+    """Returns True if this user was never seen before."""
+    now = int(time.time())
+    with closing(Tokyo_connect_db()) as db:
+        exists = db.execute('SELECT 1 FROM users WHERE user_id=?', (user.id,)).fetchone()
+        db.execute('''INSERT INTO users(user_id,name,username,first_seen,last_seen) VALUES(?,?,?,?,?)
+                      ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, username=excluded.username, last_seen=excluded.last_seen''',
+                   (user.id, user.full_name, user.username, now, now))
+        db.commit()
+    return not exists
+
+
+# ───────────────────────── helpers ─────────────────────────
+def Tokyo_parse_time(value):
+    if value.lower().strip() == 'off':
+        return 0
+    match = re.fullmatch(r'(\d+)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks)?', value.lower().strip())
+    if not match:
+        return None
+    number, unit = int(match.group(1)), match.group(2) or 's'
+    factor = 1 if unit.startswith('s') else 60 if unit.startswith('m') else 3600 if unit.startswith('h') else 86400 if unit.startswith('d') else 604800
+    seconds = number * factor
+    return seconds if 10 <= seconds <= 365 * 86400 else None
+
+
+def Tokyo_pretty_time(seconds):
+    if not seconds:
+        return 'OFF'
+    parts = []
+    for suffix, size in [('d', 86400), ('h', 3600), ('min', 60), ('s', 1)]:
+        number, seconds = divmod(seconds, size)
+        if number:
+            parts.append(f'{number}{suffix}')
+    return ' '.join(parts) or '0s'
+
+
+def Tokyo_mention(user):
+    return f'<a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a>'
+
+
+def Tokyo_user_info(user):
+    uname = f'@{user.username}' if user.username else 'N/A'
+    return (f'👤 <b>Name:</b> {Tokyo_mention(user)}\n'
+            f'🔖 <b>Username:</b> {uname}\n'
+            f'🆔 <b>ID:</b> <code>{user.id}</code>')
+
+
+def Tokyo_chat_info(chat):
+    uname = f'@{chat.username}' if chat.username else 'Private (no username)'
+    kind = {'group': 'Group', 'supergroup': 'Supergroup', 'channel': 'Channel'}.get(chat.type, chat.type)
+    return (f'💬 <b>Name:</b> {html.escape(chat.title or "N/A")}\n'
+            f'🔗 <b>Username:</b> {uname}\n'
+            f'🆔 <b>ID:</b> <code>{chat.id}</code>\n'
+            f'📂 <b>Type:</b> {kind}')
+
+
+async def Tokyo_send_log(context, text):
+    chat_id = Tokyo_get_log_channel()
+    if not chat_id:
+        return
+    try:
+        await context.bot.send_message(chat_id, f'{text}\n\n<i>{CREDIT}</i>', parse_mode=HTML, disable_web_page_preview=True)
+    except TelegramError as error:
+        log.warning('Log channel send failed (%s): %s', chat_id, error)
+
+
+async def Tokyo_reply(update, text, markup=None, temp=True):
+    """Reply in HTML with Tokyo_Updates credit. Bot replies in groups/channels are auto-deleted to keep them clean."""
+    message = update.effective_message
+    sent = await message.reply_text(f'{text}\n\n<i>{CREDIT}</i>', parse_mode=HTML, reply_markup=markup, disable_web_page_preview=True)
+    if temp and update.effective_chat.type in AUTO_TYPES:
+        Tokyo_schedule_delete(sent.chat_id, sent.message_id, TEMP_SECONDS)
+    return sent
+
+
+# ───────────────────────── force-sub core ─────────────────────────
+async def Tokyo_missing_channels(context, user_id, force=False):
+    """Channels (global list) the user has NOT joined. Owners are always exempt."""
+    if user_id in OWNER_IDS or not Tokyo_fsub_enabled():
+        return []
+    channels = Tokyo_get_fsub_channels()
+    if not channels:
+        return []
+    cache = context.bot_data.setdefault('fsub_ok', {})
+    if not force and cache.get(user_id, 0) > time.time():
+        return []
+    missing = []
+    for channel in channels:
+        try:
+            member = await context.bot.get_chat_member(channel['id'], user_id)
+            joined = member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER) \
+                or (member.status == ChatMemberStatus.RESTRICTED and member.is_member)
+            if not joined:
+                missing.append(channel)
+        except TelegramError as error:
+            # Bot can't check this channel (removed / not admin). Don't lock everyone out; tell the owner instead.
+            log.warning('Force-sub check failed for %s: %s', channel['id'], error)
+            last = context.bot_data.setdefault('fsub_alert', {})
+            if last.get(channel['id'], 0) < time.time() - 3600:
+                last[channel['id']] = time.time()
+                await Tokyo_send_log(context, f'⚠️ <b>Force-Sub problem</b>\nChannel <code>{channel["id"]}</code> ({html.escape(channel["title"] or "")}) check nahi ho pa raha.\nBot ko us channel me admin banao.\n<code>{html.escape(str(error))}</code>')
+    if not missing:
+        if len(cache) > 5000:
+            cache.clear()
+        cache[user_id] = time.time() + 120
+    return missing
+
+
+def Tokyo_join_markup(missing):
+    rows = []
+    for channel in missing:
+        if channel['link']:
+            rows.append([InlineKeyboardButton(f'📢 Join {channel["title"] or "Channel"}', url=channel['link'])])
+    rows.append([InlineKeyboardButton('✅ I Have Joined', callback_data='fsub_verify')])
+    return InlineKeyboardMarkup(rows)
+
+
+async def Tokyo_send_start_media(message, caption, markup):
+    """Send the start picture with caption; fall back to text if the picture can't be sent."""
+    photo = Tokyo_get_config('start_pic') or START_PIC
+    try:
+        if photo:
+            return await message.reply_photo(photo, caption=caption, parse_mode=HTML, reply_markup=markup)
+        if os.path.exists(START_PIC_LOCAL):
+            with open(START_PIC_LOCAL, 'rb') as handle:
+                return await message.reply_photo(handle, caption=caption, parse_mode=HTML, reply_markup=markup)
+    except TelegramError as error:
+        log.warning('Start picture failed: %s', error)
+    return await message.reply_text(caption, parse_mode=HTML, reply_markup=markup, disable_web_page_preview=True)
+
+
+async def Tokyo_join_prompt(update, context, missing):
+    user, chat, message = update.effective_user, update.effective_chat, update.effective_message
+    markup = Tokyo_join_markup(missing)
+    if chat.type == ChatType.PRIVATE:
+        text = (f'🔒 <b>Access Locked</b>\n\nHey {Tokyo_mention(user)}, bot use karne se pehle neeche diye gaye '
+                f'channel(s) join karo, phir <b>✅ I Have Joined</b> dabao.\n\n<i>{CREDIT}</i>')
+        await Tokyo_send_start_media(message, text, markup)
+        return
+    # group: delete offending message + throttled temp warning
+    try:
+        await message.delete()
+    except TelegramError:
+        pass
+    warned = context.bot_data.setdefault('warned', {})
+    key = (chat.id, user.id)
+    if warned.get(key, 0) > time.time() - WARN_COOLDOWN:
+        return
+    warned[key] = time.time()
+    if len(warned) > 5000:
+        warned.clear()
+    text = (f'⚠️ {Tokyo_mention(user)}, group me message/command use karne ke liye pehle neeche ke channel(s) join karo, '
+            f'phir <b>✅ I Have Joined</b> dabao.\n\n<i>{CREDIT}</i>')
+    sent = await context.bot.send_message(chat.id, text, parse_mode=HTML, reply_markup=markup, disable_web_page_preview=True)
+    Tokyo_schedule_delete(sent.chat_id, sent.message_id, TEMP_SECONDS)
+
+
+def Tokyo_fsub_gate(func):
+    """Command runs only after the user has joined every force-sub channel."""
+    @functools.wraps(func)
+    async def Tokyo_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user, chat = update.effective_user, update.effective_chat
+        if not update.effective_message or not chat:
+            return
+        if chat.type == ChatType.CHANNEL:   # channel posts can only come from the channel's admins
+            await func(update, context)
+            return
+        if not user:
+            return
+        missing = await Tokyo_missing_channels(context, user.id)
+        if missing:
+            await Tokyo_join_prompt(update, context, missing)
+            return
+        await func(update, context)
+    return Tokyo_wrapper
+
+
+def Tokyo_owner_only(func):
+    @functools.wraps(func)
+    async def Tokyo_wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if not update.effective_message:
+            return
+        if not user or user.id not in OWNER_IDS:
+            hint = '' if OWNER_IDS else '\n(OWNER_IDS environment variable abhi set nahi hai.)'
+            await Tokyo_reply(update, '❌ Ye command sirf <b>bot owner</b> ke liye hai.' + hint)
+            return
+        await func(update, context)
+    return Tokyo_wrapper
+
+
+async def Tokyo_is_group_admin(update, context):
+    user, chat, message = update.effective_user, update.effective_chat, update.effective_message
+    if chat.type == ChatType.CHANNEL:   # only channel admins can post there
+        return True
+    if user and user.id in OWNER_IDS:
+        return True
+    if chat.type not in GROUP_TYPES:
+        await Tokyo_reply(update, '❌ Ye command sirf group/channel me chalti hai.')
+        return False
+    if message.sender_chat and message.sender_chat.id == chat.id:   # anonymous group admin
+        return True
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            return True
+    except TelegramError as error:
+        log.warning('Group-admin check failed: %s', error)
+    await Tokyo_reply(update, '❌ Sirf group admins ye command use kar sakte hain.')
+    return False
+
+
+# ───────────────────────── start / help ─────────────────────────
+def Tokyo_start_text(user):
+    return (f'🌸 <b>{BRAND} | ᴀᴜᴛᴏ ᴅᴇʟᴇᴛᴇ ʙᴏᴛ</b>\n\n'
+            f'Hey {Tokyo_mention(user)}! 👋\n'
+            'Main group ke messages ko ek set time ke baad automatically delete kar deta hoon.\n\n'
+            '✨ <b>Features</b>\n'
+            '• ⏳ Custom auto-delete timer (/set_time)\n'
+            '• 🧹 Group hamesha clean & spam-free\n'
+            '• 🔒 Force-subscribe protection\n\n'
+            '➕ Mujhe group me add karo, admin banao (<b>Delete Messages</b> permission) aur <code>/set_time 2h</code> chalao.\n\n'
+            f'ᴄʀᴇᴅɪᴛs: {BRAND}')
+
+
+def Tokyo_start_markup(bot_username):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('➕ Add Me To Your Group', url=f'https://t.me/{bot_username}?startgroup=true&admin=delete_messages')],
+        [InlineKeyboardButton('📖 Help', callback_data='help'), InlineKeyboardButton('📢 Updates', url=UPDATES_URL)],
+    ])
+
+
+def Tokyo_help_text(user_id):
+    text = ('📖 <b>Help & Commands</b>\n\n'
+            '<b>Group / Channel admins:</b>\n'
+            '• /set_time 2h — delete timer set (30s, 3min, 2h, 1d, 7200, off)\n'
+            '• /show_time — current timer\n'
+            '• /get_id — chat / user ID\n\n'
+            '⏳ Min 10 sec • Max 365 days • <code>off</code> = band. Naya timer sirf naye messages par.\n'
+            '📢 Channel me bot ko admin (Delete Messages) banao aur channel me <code>/set_time 2h</code> post karo (channel me default OFF).\n\n'
+            '⚙️ <b>Setup:</b> bot ko group admin banao (Delete Messages) aur BotFather me /setprivacy → Disable karo.\n\n' + CREDIT)
+    if user_id in OWNER_IDS:
+        text += ('\n\n👑 <b>Owner:</b>\n'
+                 '• /add_fsub -1001234567890\n• /remove_fsub -1001234567890\n• /list_fsub\n• /set_fsub on|off\n'
+                 '• /set_log -1001234567890 | off\n• /set_pic (photo par reply)\n• /stats\n\n' + CREDIT)
+    return text
+
+
+async def Tokyo_edit(query, text, markup):
+    try:
+        if query.message.photo:
+            await query.edit_message_caption(caption=text, parse_mode=HTML, reply_markup=markup)
+        else:
+            await query.edit_message_text(text, parse_mode=HTML, reply_markup=markup, disable_web_page_preview=True)
+    except BadRequest as error:
+        if 'not modified' not in str(error).lower():
+            log.warning('Edit failed: %s', error)
+
+
+async def Tokyo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user, chat, message = update.effective_user, update.effective_chat, update.effective_message
+    if not user or not message:
+        return
+    is_new = Tokyo_upsert_user(user)
+    if chat.type == ChatType.PRIVATE:
+        await Tokyo_send_log(context, f'🚀 <b>Bot Started ({"New User" if is_new else "Returning User"})</b>\n\n{Tokyo_user_info(user)}')
+    else:
+        await Tokyo_send_log(context, f'🚀 <b>Bot Started In Group</b>\n\n{Tokyo_user_info(user)}\n\n{Tokyo_chat_info(chat)}')
+    missing = await Tokyo_missing_channels(context, user.id)
+    if missing:
+        await Tokyo_join_prompt(update, context, missing)
+        return
+    sent = await Tokyo_send_start_media(message, Tokyo_start_text(user), Tokyo_start_markup(context.bot.username))
+    if chat.type in GROUP_TYPES:
+        Tokyo_schedule_delete(sent.chat_id, sent.message_id, TEMP_SECONDS)
+
+
+@Tokyo_fsub_gate
+async def Tokyo_help(update, context):
+    await Tokyo_reply(update, Tokyo_help_text(update.effective_user.id))
+
+
+async def Tokyo_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    missing = await Tokyo_missing_channels(context, user.id)
+    if missing:
+        await query.answer('❌ Pehle sab channel join karo!', show_alert=True)
+        return
+    await query.answer()
+    if query.data == 'help':
+        back = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Back', callback_data='home')]])
+        await Tokyo_edit(query, Tokyo_help_text(user.id), back)
+    else:
+        await Tokyo_edit(query, Tokyo_start_text(user), Tokyo_start_markup(context.bot.username))
+
+
+async def Tokyo_verify_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    missing = await Tokyo_missing_channels(context, user.id, force=True)
+    if missing:
+        await query.answer('❌ Abhi tak sab channel join nahi kiye!', show_alert=True)
+        return
+    await query.answer('✅ Verified! Ab bot use kar sakte ho.', show_alert=False)
+    if query.message.chat.type == ChatType.PRIVATE:
+        await Tokyo_edit(query, Tokyo_start_text(user), Tokyo_start_markup(context.bot.username))
+    else:
+        try:
+            await query.message.delete()
+        except TelegramError:
+            pass
+
+
+# ───────────────────────── group commands ─────────────────────────
+@Tokyo_fsub_gate
+async def Tokyo_set_time(update, context):
+    if not await Tokyo_is_group_admin(update, context):
+        return
+    chat = update.effective_chat
+    if not context.args:
+        await Tokyo_reply(update, '❌ Example: <code>/set_time 2h</code> | <code>/set_time 3min</code> | <code>/set_time 7200</code> | <code>/set_time off</code>')
+        return
+    seconds = Tokyo_parse_time(context.args[0])
+    if seconds is None:
+        await Tokyo_reply(update, '❌ Invalid time. Example: <code>/set_time 30s</code>, <code>/set_time 3min</code>, <code>/set_time 2h</code> (10s–365d) ya <code>off</code>.')
+        return
+    Tokyo_set_seconds(chat.id, seconds)
+    where = 'Channel' if chat.type == ChatType.CHANNEL else 'Group'
+    if seconds:
+        text = f'✅ <b>Set Time Successfully!</b>\n⏳ Auto-delete: <b>{Tokyo_pretty_time(seconds)}</b>\n💬 {where}: <b>{html.escape(chat.title or "")}</b>\nNaye messages is timer ke hisab se delete honge.'
+    else:
+        text = f'✅ <b>Auto-delete OFF Successfully!</b>\n💬 {where}: <b>{html.escape(chat.title or "")}</b>'
+    await Tokyo_reply(update, text)
+
+
+@Tokyo_fsub_gate
+async def Tokyo_show_time(update, context):
+    chat = update.effective_chat
+    seconds = Tokyo_get_seconds(chat.id, chat.type == ChatType.CHANNEL)
+    await Tokyo_reply(update, f'⏱ Current timer: <b>{Tokyo_pretty_time(seconds)}</b>')
+
+
+@Tokyo_fsub_gate
+async def Tokyo_get_id(update, context):
+    chat, user = update.effective_chat, update.effective_user
+    lines = []
+    if chat.type != ChatType.PRIVATE:
+        lines.append(f'🆔 Chat ID: <code>{chat.id}</code>')
+    if user:
+        lines.append(f'🆔 Your ID: <code>{user.id}</code>')
+    await Tokyo_reply(update, '\n'.join(lines))
+
+
+# ───────────────────────── owner commands ─────────────────────────
+def Tokyo_clear_fsub_cache(context):
+    context.bot_data['fsub_ok'] = {}
+
+
+@Tokyo_owner_only
+async def Tokyo_add_fsub(update, context):
+    if not context.args or not re.fullmatch(r'-?\d+', context.args[0]):
+        await Tokyo_reply(update, 'Example: <code>/add_fsub -1001234567890</code>\n(Channel ID chahiye, username nahi.)')
+        return
+    channel_id = int(context.args[0])
+    try:
+        chat = await context.bot.get_chat(channel_id)
+        me = await context.bot.get_chat_member(channel_id, context.bot.id)
+    except TelegramError as error:
+        await Tokyo_reply(update, f'❌ Channel nahi mila / bot us me nahi hai.\n<code>{html.escape(str(error))}</code>')
+        return
+    if me.status != ChatMemberStatus.ADMINISTRATOR:
+        await Tokyo_reply(update, '❌ Pehle bot ko us channel me <b>admin</b> banao, phir dobara add karo (warna membership check nahi hoga).')
+        return
+    link = f'https://t.me/{chat.username}' if chat.username else (chat.invite_link or None)
+    if not link:
+        try:
+            link = await context.bot.export_chat_invite_link(channel_id)
+        except TelegramError as error:
+            log.warning('Invite link failed for %s: %s', channel_id, error)
+    with closing(Tokyo_connect_db()) as db:
+        db.execute('''INSERT INTO fsub_channels(channel_id,title,username,link) VALUES(?,?,?,?)
+                      ON CONFLICT(channel_id) DO UPDATE SET title=excluded.title, username=excluded.username, link=excluded.link''',
+                   (channel_id, chat.title, chat.username, link))
+        db.commit()
+    Tokyo_clear_fsub_cache(context)
+    note = '' if link else '\n⚠️ Invite link nahi ban paya. Bot ko "Invite Users" permission do, warna join button nahi dikhega.'
+    await Tokyo_reply(update, f'✅ <b>Force-Sub Channel Added Successfully!</b> (sab groups/private me lagu).\n\n{Tokyo_chat_info(chat)}\n🔗 <b>Link:</b> {html.escape(link or "N/A")}{note}\n\nOn karne ke liye: <code>/set_fsub on</code>')
+    await Tokyo_send_log(context, f'📢 <b>Force-Sub Channel Added</b>\n\n{Tokyo_chat_info(chat)}\n\nBy: {Tokyo_user_info(update.effective_user)}')
+
+
+@Tokyo_owner_only
+async def Tokyo_remove_fsub(update, context):
+    if not context.args or not re.fullmatch(r'-?\d+', context.args[0]):
+        await Tokyo_reply(update, 'Example: <code>/remove_fsub -1001234567890</code>')
+        return
+    with closing(Tokyo_connect_db()) as db:
+        removed = db.execute('DELETE FROM fsub_channels WHERE channel_id=?', (int(context.args[0]),)).rowcount
+        db.commit()
+    Tokyo_clear_fsub_cache(context)
+    if removed and not Tokyo_get_fsub_channels():
+        Tokyo_set_config('fsub_enabled', '0')
+    await Tokyo_reply(update, '✅ <b>Force-Sub Channel Removed Successfully!</b>' if removed else '❌ Ye channel ID list me nahi hai.')
+
+
+@Tokyo_owner_only
+async def Tokyo_list_fsub(update, context):
+    channels = Tokyo_get_fsub_channels()
+    lines = [f'{i}. {html.escape(c["title"] or "Channel")} — <code>{c["id"]}</code>' for i, c in enumerate(channels, 1)]
+    state = 'ON ✅' if Tokyo_fsub_enabled() else 'OFF ❌'
+    await Tokyo_reply(update, f'📢 <b>Force-Sub (global): {state}</b>\n\n' + ('\n'.join(lines) if lines else 'Koi channel add nahi hai.') + '\n\nExample: <code>/add_fsub -1001234567890</code>')
+
+
+@Tokyo_owner_only
+async def Tokyo_set_fsub(update, context):
+    if not context.args or context.args[0].lower() not in ('on', 'off'):
+        await Tokyo_reply(update, 'Example: <code>/set_fsub on</code> | <code>/set_fsub off</code>')
+        return
+    enabled = context.args[0].lower() == 'on'
+    if enabled and not Tokyo_get_fsub_channels():
+        await Tokyo_reply(update, '❌ Pehle <code>/add_fsub -1001234567890</code> se channel add karo.')
+        return
+    Tokyo_set_config('fsub_enabled', '1' if enabled else '0')
+    Tokyo_clear_fsub_cache(context)
+    await Tokyo_reply(update, f'✅ <b>Force-Sub {"Enabled" if enabled else "Disabled"} Successfully!</b> (sab groups/private me lagu)')
+    await Tokyo_send_log(context, f'⚙️ <b>Force-Sub {"Enabled" if enabled else "Disabled"}</b>\nBy: {Tokyo_user_info(update.effective_user)}')
+
+
+@Tokyo_owner_only
+async def Tokyo_set_log(update, context):
+    if not context.args:
+        current = Tokyo_get_log_channel()
+        await Tokyo_reply(update, f'📝 Log channel: <code>{current or "not set"}</code>\nExample: <code>/set_log -1001234567890</code> | <code>/set_log off</code>')
+        return
+    arg = context.args[0].lower()
+    if arg == 'off':
+        Tokyo_set_config('log_channel', None)
+        await Tokyo_reply(update, '✅ <b>Log Channel Disabled Successfully!</b>')
+        return
+    if not re.fullmatch(r'-?\d+', arg):
+        await Tokyo_reply(update, 'Example: <code>/set_log -1001234567890</code>')
+        return
+    try:
+        chat = await context.bot.get_chat(int(arg))
+        await context.bot.send_message(chat.id, f'✅ <b>{BRAND}</b> log channel connected.', parse_mode=HTML)
+    except TelegramError as error:
+        await Tokyo_reply(update, f'❌ Log channel me message nahi bhej paya. Bot ko channel me admin banao.\n<code>{html.escape(str(error))}</code>')
+        return
+    Tokyo_set_config('log_channel', chat.id)
+    await Tokyo_reply(update, f'✅ <b>Log Channel Set Successfully!</b>\n<b>{html.escape(chat.title or "")}</b> (<code>{chat.id}</code>)')
+
+
+@Tokyo_owner_only
+async def Tokyo_set_pic(update, context):
+    message = update.effective_message
+    if context.args and context.args[0].lower() == 'reset':
+        Tokyo_set_config('start_pic', None)
+        await Tokyo_reply(update, '✅ <b>Start Picture Reset Successfully!</b>')
+        return
+    target = message.reply_to_message
+    if not target or not target.photo:
+        await Tokyo_reply(update, 'Kisi <b>photo par reply</b> karke <code>/set_pic</code> bhejo. Reset: <code>/set_pic reset</code>')
+        return
+    Tokyo_set_config('start_pic', target.photo[-1].file_id)
+    await Tokyo_reply(update, '✅ <b>Start Picture Updated Successfully!</b> /start se check karo.')
+
+
+@Tokyo_owner_only
+async def Tokyo_stats(update, context):
+    with closing(Tokyo_connect_db()) as db:
+        users = db.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+        chats = db.execute('SELECT COUNT(*) FROM chats WHERE active=1').fetchone()[0]
+        pending = db.execute('SELECT COUNT(*) FROM pending').fetchone()[0]
+    await Tokyo_reply(update, f'📊 <b>Stats</b>\n👤 Users: <b>{users}</b>\n💬 Active groups/channels: <b>{chats}</b>\n🗑 Pending deletions: <b>{pending}</b>\n📢 Force-Sub: {"ON" if Tokyo_fsub_enabled() else "OFF"} ({len(Tokyo_get_fsub_channels())} channel)')
+
+
+# ───────────────────────── bot added / removed (group + channel) ─────────────────────────
+async def Tokyo_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    event = update.my_chat_member
+    chat, adder = event.chat, event.from_user
+    if chat.type == ChatType.PRIVATE:
+        return
+    old, new = event.old_chat_member.status, event.new_chat_member.status
+    inside = (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR)
+    if old not in inside and new in inside:
+        action, title = 'added', '➕ <b>Bot Added To {kind}</b>'
+    elif old in inside and new not in inside:
+        action, title = 'removed', '➖ <b>Bot Removed From {kind}</b>'
+    elif old == ChatMemberStatus.MEMBER and new == ChatMemberStatus.ADMINISTRATOR:
+        action, title = 'promoted', '⭐ <b>Bot Promoted To Admin In {kind}</b>'
+    elif old == ChatMemberStatus.ADMINISTRATOR and new == ChatMemberStatus.MEMBER:
+        action, title = 'demoted', '⬇️ <b>Bot Demoted In {kind}</b>'
+    else:
+        return
+    kind = 'Channel' if chat.type == ChatType.CHANNEL else 'Group'
+    now = int(time.time())
+    with closing(Tokyo_connect_db()) as db:
+        if action == 'added':
+            db.execute('''INSERT INTO chats(chat_id,title,username,type,added_by,added_by_name,added_at,active) VALUES(?,?,?,?,?,?,?,1)
+                          ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, username=excluded.username, type=excluded.type,
+                          added_by=excluded.added_by, added_by_name=excluded.added_by_name, added_at=excluded.added_at, active=1''',
+                       (chat.id, chat.title, chat.username, chat.type, adder.id, adder.full_name, now))
+        elif action == 'removed':
+            db.execute('UPDATE chats SET active=0 WHERE chat_id=?', (chat.id,))
+        db.commit()
+    Tokyo_upsert_user(adder)
+    extra = ''
+    if action != 'removed':
+        can_delete = getattr(event.new_chat_member, 'can_delete_messages', None)
+        extra = f'\n\n🤖 <b>Bot Status:</b> {"Admin" if new == ChatMemberStatus.ADMINISTRATOR else "Member"}'
+        if chat.type != ChatType.CHANNEL:
+            extra += f'\n🗑 <b>Delete Permission:</b> {"Yes ✅" if can_delete else "No ❌"}'
+        try:
+            extra += f'\n👥 <b>Members:</b> {await context.bot.get_chat_member_count(chat.id)}'
+        except TelegramError:
+            pass
+    label = 'Removed By' if action == 'removed' else 'Added By' if action == 'added' else 'Changed By'
+    await Tokyo_send_log(context, f'{title.format(kind=kind)}\n\n{Tokyo_chat_info(chat)}{extra}\n\n👤 <b>{label}</b>\n{Tokyo_user_info(adder)}')
+    if action in ('added', 'promoted') and chat.type in AUTO_TYPES:
+        try:
+            if new == ChatMemberStatus.ADMINISTRATOR and getattr(event.new_chat_member, 'can_delete_messages', False):
+                text = f'✅ Thanks {Tokyo_mention(adder)}! Ab {"channel me" if chat.type == ChatType.CHANNEL else "yahan"} <code>/set_time 2h</code> se auto-delete timer set karo.'
+            else:
+                text = f'👋 Thanks {Tokyo_mention(adder)}! Mujhe <b>admin</b> banao (Delete Messages permission) taaki main messages delete kar sakun.'
+            text += f'\n\n<i>{CREDIT}</i>'
+            sent = await context.bot.send_message(chat.id, text, parse_mode=HTML)
+            Tokyo_schedule_delete(sent.chat_id, sent.message_id, 120)
+        except TelegramError:
+            pass
+
+
+# ───────────────────────── message tracking / auto delete ─────────────────────────
+async def Tokyo_track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not message or not chat or chat.type not in GROUP_TYPES:
+        return
+    is_bot = bool(user and user.is_bot and user.id not in (ANON_ADMIN_ID, CHANNEL_BOT_ID))
+    if is_bot:
+        return
+    is_command = bool(message.text and message.text.startswith('/'))
+    is_service = bool(filters.StatusUpdate.ALL.check_update(update))
+    anonymous = message.sender_chat is not None or (user and user.id in (ANON_ADMIN_ID, CHANNEL_BOT_ID))
+    if user and not anonymous and not is_command and not is_service:
+        missing = await Tokyo_missing_channels(context, user.id)
+        if missing:
+            await Tokyo_join_prompt(update, context, missing)
+            return
+    seconds = Tokyo_get_seconds(chat.id)
+    if seconds:
+        Tokyo_schedule_delete(chat.id, message.message_id, seconds)
+
+
+async def Tokyo_track_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Channel posts are auto-deleted too (bot must be channel admin with Delete Messages). Default OFF until /set_time."""
+    message, chat = update.effective_message, update.effective_chat
+    if not message or not chat or chat.type != ChatType.CHANNEL:
+        return
+    seconds = Tokyo_get_seconds(chat.id, is_channel=True)
+    if seconds:
+        Tokyo_schedule_delete(chat.id, message.message_id, seconds)
+
+
+async def Tokyo_deletion_worker(app):
+    while True:
+        try:
+            with closing(Tokyo_connect_db()) as db:
+                due = db.execute('SELECT chat_id,message_id FROM pending WHERE delete_at<=? ORDER BY delete_at LIMIT 100', (int(time.time()),)).fetchall()
+            for chat_id, message_id in due:
+                try:
+                    await app.bot.delete_message(chat_id, message_id)
+                except (BadRequest, Forbidden) as error:
+                    log.info('Delete skipped %s/%s: %s', chat_id, message_id, error)
+                except TelegramError as error:
+                    log.warning('Delete failed %s/%s: %s', chat_id, message_id, error)
+                    continue
+                with closing(Tokyo_connect_db()) as db:
+                    db.execute('DELETE FROM pending WHERE chat_id=? AND message_id=?', (chat_id, message_id))
+                    db.commit()
+        except Exception:
+            log.exception('Tokyo deletion worker error')
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
+async def Tokyo_error_handler(update, context):
+    log.error('Unhandled error: %s', context.error, exc_info=context.error)
+
+
+async def Tokyo_post_init(app):
+    user_cmds = [BotCommand('start', 'Start the bot'), BotCommand('help', 'Help & commands'),
+                 BotCommand('set_time', 'Set auto-delete time (admins)'), BotCommand('show_time', 'Show current timer'),
+                 BotCommand('get_id', 'Show chat / user ID')]
+    owner_cmds = user_cmds + [BotCommand('add_fsub', 'Add force-sub channel ID'), BotCommand('remove_fsub', 'Remove force-sub channel'),
+                              BotCommand('list_fsub', 'List force-sub channels'), BotCommand('set_fsub', 'Force-sub on/off'),
+                              BotCommand('set_log', 'Set log channel'), BotCommand('set_pic', 'Set start picture'), BotCommand('stats', 'Bot stats')]
+    try:
+        await app.bot.set_my_commands(user_cmds)
+        for owner_id in OWNER_IDS:
+            try:
+                await app.bot.set_my_commands(owner_cmds, scope=BotCommandScopeChat(owner_id))
+            except TelegramError:
+                pass  # owner hasn't started the bot yet
+    except TelegramError as error:
+        log.warning('set_my_commands failed: %s', error)
+    app.bot_data['worker'] = app.create_task(Tokyo_deletion_worker(app))
+    if not OWNER_IDS:
+        log.warning('OWNER_IDS is empty: nobody can use owner commands (fsub / log / pic). Set OWNER_IDS env.')
+
+
+def Tokyo_main():
+    if not BOT_TOKEN:
+        raise RuntimeError('BOT_TOKEN missing. Set it in environment variables; do not upload your token to GitHub.')
+    Tokyo_init_db()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).post_init(Tokyo_post_init).build()
+    handlers = [
+        ('start', Tokyo_start), ('help', Tokyo_help),
+        ('set_time', Tokyo_set_time), ('show_time', Tokyo_show_time), ('get_id', Tokyo_get_id),
+        ('add_fsub', Tokyo_add_fsub), ('remove_fsub', Tokyo_remove_fsub), ('list_fsub', Tokyo_list_fsub),
+        ('set_fsub', Tokyo_set_fsub), ('set_log', Tokyo_set_log), ('set_pic', Tokyo_set_pic), ('stats', Tokyo_stats),
+    ]
+    for command, callback in handlers:
+        app.add_handler(CommandHandler(command, callback, filters=filters.UpdateType.MESSAGE | filters.UpdateType.CHANNEL_POST))
+    app.add_handler(CallbackQueryHandler(Tokyo_verify_cb, pattern='^fsub_verify$'))
+    app.add_handler(CallbackQueryHandler(Tokyo_menu_cb, pattern='^(help|home)$'))
+    app.add_handler(ChatMemberHandler(Tokyo_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & ~filters.ChatType.PRIVATE & ~filters.ChatType.CHANNEL, Tokyo_track_message), group=1)
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, Tokyo_track_channel_post), group=1)
+    app.add_error_handler(Tokyo_error_handler)
+    log.info('%s Auto-Delete Bot is starting. Credits: Tokyo_Updates', BRAND)
+    app.run_polling(allowed_updates=[Update.MESSAGE, Update.CHANNEL_POST, Update.CALLBACK_QUERY, Update.MY_CHAT_MEMBER])
+
+
+if __name__ == '__main__':
+    Tokyo_main()
