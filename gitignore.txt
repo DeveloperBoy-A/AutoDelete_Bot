@@ -1,0 +1,9 @@
+# Tokyo_Updates Auto-Delete Bot | Credits: Tokyo_Updates
+__pycache__/
+*.py[cod]
+.env
+*.sqlite3
+*.db
+data/
+.venv/
+venv/
