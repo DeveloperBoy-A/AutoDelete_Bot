@@ -1,0 +1,30 @@
+# Tokyo_Updates Auto-Delete Bot | Credits: Tokyo_Updates
+# Render Blueprint: creates a Background Worker + persistent disk (paid plan needed for workers/disks).
+services:
+  - type: worker
+    name: tokyo-updates-auto-delete-bot
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    disk:
+      name: tokyo-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_IDS
+        sync: false
+      - key: LOG_CHANNEL
+        value: ""
+      - key: START_PIC
+        value: ""
+      - key: UPDATES_URL
+        value: "https://t.me/Tokyo_Updates"
+      - key: DB_PATH
+        value: /var/data/tokyo_autodelete.sqlite3
+      - key: CHECK_INTERVAL
+        value: "10"
+      - key: DEFAULT_DELETE_SECONDS
+        value: "7200"
