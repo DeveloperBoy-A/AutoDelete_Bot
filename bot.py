@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import time
 import types
 from contextlib import closing
@@ -42,7 +43,20 @@ class Tokyo_SafeFormatter(logging.Formatter):
         return Tokyo_TOKEN_RE.sub('<BOT_TOKEN_HIDDEN>', super().format(record))
 
 
+Tokyo_STATE = {'conflict': False}
+
+
+class Tokyo_ConflictWatch(logging.Filter):
+    """Notices 'Conflict: terminated by other getUpdates' (same token running twice) so the bot can wait + restart."""
+    def filter(self, record):
+        error = record.exc_info[1] if record.exc_info else None
+        if (error is not None and type(error).__name__ == 'Conflict') or 'terminated by other getUpdates' in record.getMessage():
+            Tokyo_STATE['conflict'] = True
+        return True
+
+
 Tokyo_handler = logging.StreamHandler()
+Tokyo_handler.addFilter(Tokyo_ConflictWatch())
 Tokyo_handler.setFormatter(Tokyo_SafeFormatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s'))
 logging.basicConfig(level=logging.INFO, handlers=[Tokyo_handler])
 for Tokyo_noisy in ('httpx', 'httpcore'):
@@ -70,6 +84,10 @@ def Tokyo_init_db():
         CREATE TABLE IF NOT EXISTS chats(chat_id INTEGER PRIMARY KEY, title TEXT, username TEXT, type TEXT, added_by INTEGER, added_by_name TEXT, added_at INTEGER, active INTEGER NOT NULL DEFAULT 1);
         CREATE INDEX IF NOT EXISTS pending_due ON pending(delete_at);
         ''')
+        try:
+            db.execute('ALTER TABLE users ADD COLUMN started INTEGER NOT NULL DEFAULT 0')
+        except sqlite3.OperationalError:
+            pass  # column already exists
         db.commit()
 
 
@@ -136,6 +154,15 @@ def Tokyo_upsert_user(user):
                    (user.id, user.full_name, user.username, now, now))
         db.commit()
     return not exists
+
+
+def Tokyo_mark_started(user):
+    """True only the FIRST time this user ever presses /start (so the log channel gets one entry per user)."""
+    Tokyo_upsert_user(user)
+    with closing(Tokyo_connect_db()) as db:
+        changed = db.execute('UPDATE users SET started=1 WHERE user_id=? AND started=0', (user.id,)).rowcount
+        db.commit()
+    return bool(changed)
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -389,11 +416,11 @@ async def Tokyo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user, chat, message = update.effective_user, update.effective_chat, update.effective_message
     if not user or not message:
         return
-    is_new = Tokyo_upsert_user(user)
-    if chat.type == ChatType.PRIVATE:
-        await Tokyo_send_log(context, f'🚀 <b>Bot Started ({"New User" if is_new else "Returning User"})</b>\n\n{Tokyo_user_info(user)}')
-    else:
-        await Tokyo_send_log(context, f'🚀 <b>Bot Started In Group</b>\n\n{Tokyo_user_info(user)}\n\n{Tokyo_chat_info(chat)}')
+    if Tokyo_mark_started(user):   # log only once per user, never again on repeated /start
+        if chat.type == ChatType.PRIVATE:
+            await Tokyo_send_log(context, f'🚀 <b>New User Started The Bot</b>\n\n{Tokyo_user_info(user)}')
+        else:
+            await Tokyo_send_log(context, f'🚀 <b>New User Started The Bot (In Group)</b>\n\n{Tokyo_user_info(user)}\n\n{Tokyo_chat_info(chat)}')
     missing = await Tokyo_missing_channels(context, user.id)
     if missing:
         await Tokyo_join_prompt(update, context, missing)
@@ -710,7 +737,24 @@ async def Tokyo_deletion_worker(app):
 
 
 async def Tokyo_error_handler(update, context):
-    log.error('Unhandled error: %s', context.error, exc_info=context.error)
+    error = context.error
+    if type(error).__name__ == 'Conflict':
+        Tokyo_STATE['conflict'] = True
+        return
+    log.error('Unhandled error: %s', error, exc_info=error)
+    text = Tokyo_TOKEN_RE.sub('<hidden>', f'{type(error).__name__}: {error}')[:300]
+    where = ''
+    if isinstance(update, Update) and update.effective_chat:
+        where = f'\n💬 Chat: <code>{update.effective_chat.id}</code>'
+    await Tokyo_send_log(context, f'⚠️ <b>Error</b>{where}\n<code>{html.escape(text)}</code>')
+    try:
+        message = update.effective_message if isinstance(update, Update) else None
+        if message and message.text and message.text.startswith('/') and update.effective_chat.type != ChatType.CHANNEL:
+            sent = await message.reply_text(f'⚠️ Kuch gadbad ho gayi, owner ko bata diya gaya.\n\n<i>{CREDIT}</i>', parse_mode=HTML)
+            if update.effective_chat.type in GROUP_TYPES:
+                Tokyo_schedule_delete(sent.chat_id, sent.message_id, TEMP_SECONDS)
+    except TelegramError:
+        pass
 
 
 Tokyo_FONT = {
@@ -821,7 +865,17 @@ def Tokyo_main():
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, Tokyo_track_channel_post), group=1)
     app.add_error_handler(Tokyo_error_handler)
     log.info('%s Auto-Delete Bot is starting. Credits: Tokyo_Updates', BRAND)
-    app.run_polling(allowed_updates=[Update.MESSAGE, Update.CHANNEL_POST, Update.CALLBACK_QUERY, Update.MY_CHAT_MEMBER])
+    try:
+        app.run_polling(allowed_updates=[Update.MESSAGE, Update.CHANNEL_POST, Update.CALLBACK_QUERY, Update.MY_CHAT_MEMBER])
+    finally:
+        if Tokyo_STATE['conflict']:
+            retry = int(os.environ.get('TOKYO_CONFLICT_RETRY', '0'))
+            delay = min(20 * (2 ** retry), 300)
+            os.environ['TOKYO_CONFLICT_RETRY'] = str(retry + 1)
+            log.error('⚠️ CONFLICT: ye BOT_TOKEN kahin aur bhi chal raha hai (purana deploy / dusri Render service / PC / Termux). '
+                      'Us dusre instance ko band karo. %s sec baad restart kar raha hoon... | Credits: Tokyo_Updates', delay)
+            time.sleep(delay)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == '__main__':
