@@ -1,0 +1,65 @@
+# ᴛᴏᴋʏᴏ_ᴜᴘᴅᴀᴛᴇs | Auto-Delete Bot
+
+**Credits / Branding: Tokyo_Updates**
+
+Telegram Bot API bot (python-telegram-bot + local SQLite, **no MongoDB**). Group messages auto-delete after a timer, with **global owner-controlled Force-Sub**, a **log channel**, and a `/start` menu with picture.
+
+## Commands
+**Everyone (only after joining the Force-Sub channels)**
+
+| Command | What it does |
+|---|---|
+| `/start` | Start menu with picture + buttons |
+| `/help` | Command list |
+| `/show_time` | Current delete timer |
+| `/get_id` | Chat ID / your ID |
+
+**Group / Channel admins:** `/set_time 2h` (also `30s`, `3min`, `1d`, `7200`; min 10s, max 365d; `/set_time off` stops auto-delete). Replies like **Set Time Successfully ✅** are shown and auto-deleted too.
+
+**Owner only** (`OWNER_IDS`)
+
+| Command | Example |
+|---|---|
+| `/add_fsub` | `/add_fsub -1001234567890` (channel **ID**, bot must be admin there) |
+| `/remove_fsub` | `/remove_fsub -1001234567890` |
+| `/list_fsub` | shows channels + ON/OFF |
+| `/set_fsub` | `/set_fsub on` / `off` |
+| `/set_log` | `/set_log -1001234567890` / `off` |
+| `/set_pic` | reply to a photo to change the start picture (`/set_pic reset` to restore) |
+| `/stats` | users / groups / pending deletions |
+
+## Channel auto-delete
+- Add the bot as **admin with Delete Messages** in your channel, then post `/set_time 2h` in the channel. Every new channel post is deleted after that time.
+- Channels stay **OFF by default** (so nothing is deleted by accident) until `/set_time` is used. `/show_time` and `/set_time off` work there too.
+
+## Force-Sub (global)
+- Only the owner can add/remove channels or switch it on/off; it applies to **every** group and private chat.
+- Channels are stored by **channel ID**. Join buttons use the public link, or an invite link the bot creates (give it *Invite Users* permission for private channels).
+- Users who haven't joined: commands are blocked, and in groups their messages are deleted with a temporary join warning. The **✅ I Have Joined** button re-checks instantly.
+- Owners are exempt. If the bot can't check a channel (removed / not admin), users are **not** locked out; a warning goes to the log channel.
+
+## Log channel
+Add the bot as admin in a channel and run `/set_log <channel id>`. It logs:
+- Someone starts the bot (name, username, ID; plus group info if started in a group)
+- Bot added / removed / promoted in a group or channel: **who did it** (name, username, ID) and the group/channel name, username, ID, type, member count, delete permission
+- Force-Sub changes and Force-Sub problems
+
+## Pictures
+- `assets/start.jpg` is the `/start` banner (1280×720). Replace the file, set `START_PIC`, or use `/set_pic`.
+- `assets/bot_profile.jpg` is a ready bot profile picture: upload it in **@BotFather → /setuserpic**.
+- `python make_assets.py` regenerates both (needs Pillow, optional).
+
+## Setup
+1. Create a bot with `@BotFather`, copy the token; `/setprivacy` → **Disable**.
+2. Set env vars: `BOT_TOKEN`, `OWNER_IDS` (your Telegram ID).
+3. Add bot to the group as admin with **Delete Messages**.
+4. Add bot as admin in each Force-Sub channel and in the log channel, then use the owner commands above.
+
+## Run / Deploy
+```bash
+pip install -r requirements.txt
+python bot.py
+```
+Render: Background Worker via `render.yaml`/`Dockerfile`; mount a persistent disk at `/var/data` so settings and pending deletions survive restarts. Never run two copies with the same token.
+
+**Made for Tokyo_Updates. Credits: Tokyo_Updates.**
