@@ -11,6 +11,7 @@ import os
 import re
 import sqlite3
 import time
+import types
 from contextlib import closing
 
 from telegram import (BotCommand, BotCommandScopeChat, InlineKeyboardButton,
@@ -32,7 +33,20 @@ ANON_ADMIN_ID, CHANNEL_BOT_ID = 1087968824, 136817688
 TEMP_SECONDS = 60          # bot's own temporary replies in groups are deleted after this
 WARN_COOLDOWN = 20         # seconds between join-warnings for the same user in a chat
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(name)s | %(message)s')
+# Tokyo_Updates: hide the bot token from logs (httpx prints full Telegram URLs that contain it)
+Tokyo_TOKEN_RE = re.compile(r'\d{6,}:[A-Za-z0-9_-]{30,}')
+
+
+class Tokyo_SafeFormatter(logging.Formatter):
+    def format(self, record):
+        return Tokyo_TOKEN_RE.sub('<BOT_TOKEN_HIDDEN>', super().format(record))
+
+
+Tokyo_handler = logging.StreamHandler()
+Tokyo_handler.setFormatter(Tokyo_SafeFormatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s'))
+logging.basicConfig(level=logging.INFO, handlers=[Tokyo_handler])
+for Tokyo_noisy in ('httpx', 'httpcore'):
+    logging.getLogger(Tokyo_noisy).setLevel(logging.WARNING)   # no more per-request getUpdates spam
 log = logging.getLogger('Tokyo_Updates.AutoDelete')
 
 
@@ -699,6 +713,67 @@ async def Tokyo_error_handler(update, context):
     log.error('Unhandled error: %s', context.error, exc_info=context.error)
 
 
+Tokyo_FONT = {
+    'T': ['█████', '  █  ', '  █  ', '  █  ', '  █  '], 'O': [' ███ ', '█   █', '█   █', '█   █', ' ███ '],
+    'K': ['█   █', '█  █ ', '███  ', '█  █ ', '█   █'], 'Y': ['█   █', ' █ █ ', '  █  ', '  █  ', '  █  '],
+    'U': ['█   █', '█   █', '█   █', '█   █', ' ███ '], 'P': ['████ ', '█   █', '████ ', '█    ', '█    '],
+    'D': ['████ ', '█   █', '█   █', '█   █', '████ '], 'A': [' ███ ', '█   █', '█████', '█   █', '█   █'],
+    'E': ['█████', '█    ', '████ ', '█    ', '█████'], 'S': [' ████', '█    ', ' ███ ', '    █', '████ '],
+    ' ': ['   ', '   ', '   ', '   ', '   '],
+}
+
+
+def Tokyo_big_text(word):
+    return '\n'.join('   ' + '  '.join(Tokyo_FONT[ch][row] for ch in word) for row in range(5))
+
+
+def Tokyo_build_banner(bot_name, username, bot_id):
+    channels = Tokyo_get_fsub_channels()
+    log_channel = Tokyo_get_log_channel()
+    line = '═' * 62
+    return '\n'.join([
+        '', f'╔{line}╗', Tokyo_big_text('TOKYO'), '', Tokyo_big_text('UPDATES'), f'╚{line}╝', '',
+        '   ✅✅✅   BOT IS LIVE & RUNNING   ✅✅✅', '',
+        f'   🤖 Bot        : {bot_name} (@{username})  [ID: {bot_id}]',
+        f'   👑 Owners     : {len(OWNER_IDS)} set' + ('' if OWNER_IDS else '  ⚠️ OWNER_IDS missing!'),
+        f'   📢 Force-Sub  : {"ON" if Tokyo_fsub_enabled() else "OFF"} ({len(channels)} channel)',
+        f'   📝 Log channel: {log_channel or "not set"}',
+        f'   🗑 Default timer: {Tokyo_pretty_time(DEFAULT_DELETE_SECONDS)}  |  DB: {DB_PATH}',
+        '', f'   🌸 {BRAND}  |  ᴄʀᴇᴅɪᴛs: Tokyo_Updates', f'   ✅ Deploy complete — bot is online & polling Telegram.', '',
+    ])
+
+
+async def Tokyo_health_server():
+    """Tiny HTTP responder for hosts that need an open $PORT (e.g. Render Web Service). Skipped when PORT is not set."""
+    port = os.getenv('PORT', '')
+    if not port.isdigit():
+        return None
+
+    async def Tokyo_handle(reader, writer):
+        try:
+            await asyncio.wait_for(reader.read(1024), timeout=5)
+            body = b'Tokyo_Updates Auto-Delete Bot is running | Credits: Tokyo_Updates'
+            writer.write(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' % len(body) + body)
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(Tokyo_handle, '0.0.0.0', int(port))
+    log.info('Tokyo_Updates health server listening on port %s', port)
+    return server
+
+
+async def Tokyo_post_shutdown(app):
+    worker = app.bot_data.get('worker')
+    if worker:
+        worker.cancel()
+    server = app.bot_data.get('health')
+    if server:
+        server.close()
+
+
 async def Tokyo_post_init(app):
     user_cmds = [BotCommand('start', 'Start the bot'), BotCommand('help', 'Help & commands'),
                  BotCommand('set_time', 'Set auto-delete time (admins)'), BotCommand('show_time', 'Show current timer'),
@@ -715,7 +790,13 @@ async def Tokyo_post_init(app):
                 pass  # owner hasn't started the bot yet
     except TelegramError as error:
         log.warning('set_my_commands failed: %s', error)
-    app.bot_data['worker'] = app.create_task(Tokyo_deletion_worker(app))
+    app.bot_data['worker'] = asyncio.get_running_loop().create_task(Tokyo_deletion_worker(app))
+    app.bot_data['health'] = await Tokyo_health_server()
+    try:
+        print(Tokyo_build_banner(app.bot.first_name, app.bot.username, app.bot.id), flush=True)
+        await Tokyo_send_log(types.SimpleNamespace(bot=app.bot), f'✅✅ <b>Bot Is Live!</b>\n🤖 @{app.bot.username}\n🌸 {BRAND}')
+    except Exception:
+        log.exception('Startup banner failed')
     if not OWNER_IDS:
         log.warning('OWNER_IDS is empty: nobody can use owner commands (fsub / log / pic). Set OWNER_IDS env.')
 
@@ -724,7 +805,7 @@ def Tokyo_main():
     if not BOT_TOKEN:
         raise RuntimeError('BOT_TOKEN missing. Set it in environment variables; do not upload your token to GitHub.')
     Tokyo_init_db()
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).post_init(Tokyo_post_init).build()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).post_init(Tokyo_post_init).post_shutdown(Tokyo_post_shutdown).build()
     handlers = [
         ('start', Tokyo_start), ('help', Tokyo_help),
         ('set_time', Tokyo_set_time), ('show_time', Tokyo_show_time), ('get_id', Tokyo_get_id),
