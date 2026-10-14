@@ -11,10 +11,10 @@ Telegram Bot API bot (python-telegram-bot + local SQLite, **no MongoDB**). Group
 |---|---|
 | `/start` | Start menu with picture + buttons |
 | `/help` | Command list |
-| `/show_time` | Current delete timer |
+| `/show_time` | Current delete timer (time + ✅ ON / ❌ OFF) |
 | `/get_id` | Chat ID / your ID |
 
-**Group / Channel admins:** `/set_time 2h` (also `30s`, `3min`, `1d`, `7200`; min 10s, max 365d; `/set_time off` stops auto-delete). Replies like **Set Time Successfully ✅** are shown and auto-deleted too.
+**Group / Channel admins:** `/set_timer 2h` (also `30s`, `3min`, `1d`, `7200`; min 10s, max 365d; `/set_timer off` stops auto-delete). Replies like **Set Time Successfully ✅** are shown and auto-deleted too.
 
 **Owner only** (`OWNER_IDS`)
 
@@ -29,8 +29,8 @@ Telegram Bot API bot (python-telegram-bot + local SQLite, **no MongoDB**). Group
 | `/stats` | users / groups / pending deletions |
 
 ## Channel auto-delete
-- Add the bot as **admin with Delete Messages** in your channel, then post `/set_time 2h` in the channel. Every new channel post is deleted after that time.
-- Channels stay **OFF by default** (so nothing is deleted by accident) until `/set_time` is used. `/show_time` and `/set_time off` work there too.
+- Add the bot as **admin with Delete Messages** in your channel, then post `/set_timer 2h` in the channel. Every new channel post is deleted after that time.
+- Groups and channels stay **OFF by default** (nothing is deleted) until an admin uses `/set_timer`. `/show_time` and `/set_timer off` work there too.
 
 ## Force-Sub (global)
 - Only the owner can add/remove channels or switch it on/off; it applies to **every** group and private chat.
@@ -50,10 +50,11 @@ Now the bot keeps a **backup of its database in the log channel** (one pinned fi
 - Needs: a log channel (`LOG_CHANNEL` env / `info.py`, or `/set_log`) and the bot as **admin** there with **Post Messages** + **Pin Messages** (channels: **Edit Messages**). Don't pin other messages in that channel.
 - Backups run ~30 s after any change (timer, force-sub, log channel, bot added/removed) and once more on a graceful shutdown.
 - On every start the log channel gets **🔄 Bot Restarted** (with *restored from backup / loaded from disk / fresh start*), and the console banner says **BOT RESTARTED**.
+- The bot also keeps one copy of the database in **RAM**, replaced by a fresh one every **7 days** (old copy dropped). If the database file is lost/emptied while the bot runs, it is restored from that copy.
 - If your host has a persistent disk, mount it and set `DB_PATH` to it (then the backup is just a safety copy). `BACKUP_TO_LOG=0` turns the backup off.
 
 ## Output style
-All bot messages, buttons and command descriptions are shown in **small caps**. Commands, `<code>` examples, @usernames, links and chat/channel names are left as they are. `/set_time` and `/set_log` replies no longer show the chat name.
+All bot messages, buttons and command descriptions are shown in **small caps**. Commands, `<code>` examples, @usernames, links and chat/channel names are left as they are. `/set_timer` and `/set_log` replies no longer show the chat name.
 
 ## Pictures
 - `assets/start.jpg` is the `/start` banner (1280×720). Replace the file, set `START_PIC`, or use `/set_pic`.
