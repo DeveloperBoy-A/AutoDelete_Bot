@@ -24,3 +24,7 @@ START_PIC = os.getenv('START_PIC', '').strip()
 START_PIC_LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'start.jpg')
 
 UPDATES_URL = os.getenv('UPDATES_URL', 'https://t.me/+JBAI-hnBgcY2ODY1').strip()
+
+# Settings (timers, force-sub, log channel...) are backed up to the LOG CHANNEL (pinned file) and restored automatically
+# when the host wipes the disk on restart. Needs: log channel set + bot admin there (Post + Pin/Edit Messages). 0 = off.
+BACKUP_TO_LOG = os.getenv('BACKUP_TO_LOG', '1').strip() != '0'
