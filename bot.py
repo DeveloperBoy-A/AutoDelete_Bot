@@ -781,24 +781,25 @@ async def Tokyo_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ───────────────────────── message tracking / auto delete ─────────────────────────
 async def Tokyo_track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not message or not chat or chat.type not in GROUP_TYPES:
-        return
-    Tokyo_touch_chat(context, chat)
-    is_bot = bool(user and user.is_bot and user.id not in (ANON_ADMIN_ID, CHANNEL_BOT_ID))
-    if is_bot:
-        return
-    is_command = bool(message.text and message.text.startswith('/'))
-    is_service = bool(filters.StatusUpdate.ALL.check_update(update))
-    anonymous = message.sender_chat is not None or (user and user.id in (ANON_ADMIN_ID, CHANNEL_BOT_ID))
-    if user and not anonymous and not is_command and not is_service:
-        missing = await Tokyo_missing_channels(context, user.id)
-        if missing:
-            await Tokyo_join_prompt(update, context, missing)
-            return
-    seconds = Tokyo_get_seconds(chat.id)
-    if seconds:
-        Tokyo_schedule_delete(chat.id, message.message_id, seconds)
+message, chat, user = update.effective_message, update.effective_chat, update.effective_user
+if not message or not chat or chat.type not in GROUP_TYPES:
+return
+
+Tokyo_touch_chat(context, chat)
+
+is_bot = bool(user and user.is_bot and user.id not in (ANON_ADMIN_ID, CHANNEL_BOT_ID))
+if is_bot:
+    return
+
+is_command = bool(message.text and message.text.startswith('/'))
+is_service = bool(filters.StatusUpdate.ALL.check_update(update))
+anonymous = message.sender_chat is not None or (user and user.id in (ANON_ADMIN_ID, CHANNEL_BOT_ID))
+
+# Fsub check is handled by command decorators only.
+# Normal messages must not trigger force-sub.
+seconds = Tokyo_get_seconds(chat.id)
+if seconds and not is_service:
+    Tokyo_schedule_delete(chat.id, message.message_id, seconds)
 
 
 async def Tokyo_track_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1077,20 +1078,28 @@ def Tokyo_ram_unpack(data):
 
 
 async def Tokyo_ram_check(bot):
-    """Keep one database copy in RAM, replaced by a new one every 7 days (the old one is dropped).
-    If the database file is lost/emptied while the bot is running, bring it back from that copy."""
-    ram = Tokyo_STATE['ram']
-    if ram and not Tokyo_db_healthy():
-        if await asyncio.to_thread(Tokyo_ram_unpack, ram[1]):
-            Tokyo_init_db()
-            log.warning('Database was missing - restored from the RAM copy.')
-            await Tokyo_send_log(types.SimpleNamespace(bot=bot), '♻️ <b>Database Restored From RAM Copy</b>\nDatabase file gone mila, RAM backup se wapas laaya gaya.')
-        return
-    if ram is None or time.time() - ram[0] >= RAM_DAYS * 86400:
+    """Keep the latest database snapshot in RAM and restore if database is lost."""
+    try:
         data = await asyncio.to_thread(Tokyo_ram_snapshot)
-        Tokyo_STATE['ram'], old = (time.time(), data), Tokyo_STATE['ram']
-        del old   # the previous copy is released from RAM
-        log.info('RAM database copy refreshed (%d KB).', len(data) // 1024)
+        old = Tokyo_STATE.get('ram')
+        Tokyo_STATE['ram'] = (time.time(), data)
+
+        if old:
+            del old
+
+        log.info('RAM backup refreshed (%d KB).', len(data) // 1024)
+
+        if not Tokyo_db_healthy():
+            ram = Tokyo_STATE.get('ram')
+            if ram and await asyncio.to_thread(Tokyo_ram_unpack, ram[1]):
+                Tokyo_init_db()
+                log.warning('Database restored from RAM backup.')
+                await Tokyo_send_log(
+                    types.SimpleNamespace(bot=bot),
+                    '♻️ <b>Database Restored From RAM Backup</b>'
+                )
+    except Exception:
+        log.exception('RAM backup failed')
 
 
 async def Tokyo_ram_worker(app):
@@ -1103,13 +1112,23 @@ async def Tokyo_ram_worker(app):
 
 
 async def Tokyo_post_stop(app):
-    """Graceful shutdown (redeploy / SIGTERM): save the very latest data before the host wipes the disk."""
+    """Save the latest database backup during graceful shutdown."""
     if not BACKUP_TO_LOG or Tokyo_STATE['conflict']:
         return
+
     try:
-        await asyncio.wait_for(Tokyo_backup_now(app.bot), timeout=25)
+        data = await asyncio.to_thread(Tokyo_ram_snapshot)
+        Tokyo_STATE['ram'] = (time.time(), data)
+
+        await asyncio.wait_for(
+            Tokyo_backup_now(app.bot),
+            timeout=25
+        )
+
+        log.info('Final RAM and log-channel backup completed.')
+
     except Exception:
-        log.warning('Final backup on shutdown failed')
+        log.exception('Final shutdown backup failed')
 
 
 async def Tokyo_post_shutdown(app):
