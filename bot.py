@@ -77,7 +77,7 @@ class Tokyo_SafeFormatter(logging.Formatter):
         return Tokyo_TOKEN_RE.sub('<BOT_TOKEN_HIDDEN>', super().format(record))
 
 
-Tokyo_STATE = {'conflict': False, 'dirty': False, 'fresh_db': False, 'backup_msg': None, 'data': 'disk', 'pin_warned': 0, 'lock': None}
+Tokyo_STATE = {'ram': None, 'conflict': False, 'dirty': False, 'fresh_db': False, 'backup_msg': None, 'data': 'disk', 'pin_warned': 0, 'lock': None}
 BACKUP_NAME = 'tokyo_backup.sqlite3.gz'
 BACKUP_MIN_GAP = 30        # seconds between two backups (changes are batched)
 Tokyo_DATA_LABEL = {'restored': 'Settings restored from backup ✅', 'disk': 'Settings loaded from disk ✅',
@@ -129,6 +129,22 @@ def Tokyo_init_db():
         db.commit()
 
 
+def Tokyo_touch_chat(context, chat):
+    """Register a group/channel the first time we see it (once per run), so /stats is complete."""
+    seen = context.bot_data.setdefault('seen_chats', set())
+    if chat.id in seen:
+        return
+    seen.add(chat.id)
+    with closing(Tokyo_connect_db()) as db:
+        row = db.execute('SELECT active FROM chats WHERE chat_id=?', (chat.id,)).fetchone()
+        db.execute('''INSERT INTO chats(chat_id,title,username,type,added_at,active) VALUES(?,?,?,?,?,1)
+                      ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, username=excluded.username, type=excluded.type, active=1''',
+                   (chat.id, chat.title, chat.username, chat.type, int(time.time())))
+        db.commit()
+    if not row or not row[0]:
+        Tokyo_mark_dirty()
+
+
 def Tokyo_mark_dirty():
     """Something changed -> the backup worker uploads a fresh backup to the log channel."""
     Tokyo_STATE['dirty'] = True
@@ -151,12 +167,12 @@ def Tokyo_set_config(key, value):
 
 
 def Tokyo_get_seconds(chat_id, is_channel=False):
-    """Delete delay in seconds. 0 = OFF. Channels stay OFF until an admin runs /set_time (safe default)."""
+    """Delete delay in seconds. 0 = OFF. Groups AND channels stay OFF until an admin runs /set_timer."""
     with closing(Tokyo_connect_db()) as db:
         row = db.execute('SELECT seconds FROM settings WHERE chat_id=?', (chat_id,)).fetchone()
     if row:
         return row[0]
-    return 0 if is_channel else DEFAULT_DELETE_SECONDS
+    return 0
 
 
 def Tokyo_set_seconds(chat_id, seconds):
@@ -420,10 +436,10 @@ def Tokyo_start_text(user):
             f'Hey {Tokyo_mention(user)}! 👋\n'
             'Main group ke messages ko ek set time ke baad automatically delete kar deta hoon.\n\n'
             '✨ <b>Features</b>\n'
-            '• ⏳ Custom auto-delete timer (/set_time)\n'
+            '• ⏳ Custom auto-delete timer (/set_timer)\n'
             '• 🧹 Group hamesha clean & spam-free\n'
             '• 🔒 Force-subscribe protection\n\n'
-            '➕ Mujhe group me add karo, admin banao (<b>Delete Messages</b> permission) aur <code>/set_time 2h</code> chalao.\n\n'
+            '➕ Mujhe group me add karo, admin banao (<b>Delete Messages</b> permission) aur <code>/set_timer 2h</code> chalao.\n\n'
             f'ᴄʀᴇᴅɪᴛs: {BRAND}')
 
 
@@ -437,11 +453,11 @@ def Tokyo_start_markup(bot_username):
 def Tokyo_help_text(user_id):
     text = ('📖 <b>Help & Commands</b>\n\n'
             '<b>Group / Channel admins:</b>\n'
-            '• <code>/set_time 2h</code> — delete timer set (<code>30s</code>, <code>3min</code>, <code>2h</code>, <code>1d</code>, <code>7200</code>, <code>off</code>)\n'
+            '• <code>/set_timer 2h</code> — delete timer set (<code>30s</code>, <code>3min</code>, <code>2h</code>, <code>1d</code>, <code>7200</code>, <code>off</code>)\n'
             '• /show_time — current timer\n'
             '• /get_id — chat / user ID\n\n'
             '⏳ Min 10 sec • Max 365 days • <code>off</code> = band. Naya timer sirf naye messages par.\n'
-            '📢 Channel me bot ko admin (Delete Messages) banao aur channel me <code>/set_time 2h</code> post karo (channel me default OFF).\n\n'
+            '📢 Channel me bot ko admin (Delete Messages) banao aur channel me <code>/set_timer 2h</code> post karo (jab tak timer set na ho, auto-delete OFF rehta hai).\n\n'
             '⚙️ <b>Setup:</b> bot ko group admin banao (Delete Messages) aur BotFather me /setprivacy → Disable karo.\n\n' + CREDIT)
     if user_id in OWNER_IDS:
         text += ('\n\n👑 <b>Owner:</b>\n'
@@ -519,16 +535,16 @@ async def Tokyo_verify_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ───────────────────────── group commands ─────────────────────────
 @Tokyo_fsub_gate
-async def Tokyo_set_time(update, context):
+async def Tokyo_set_timer(update, context):
     if not await Tokyo_is_group_admin(update, context):
         return
     chat = update.effective_chat
     if not context.args:
-        await Tokyo_reply(update, '❌ Example: <code>/set_time 2h</code> | <code>/set_time 3min</code> | <code>/set_time 7200</code> | <code>/set_time off</code>')
+        await Tokyo_reply(update, '❌ Example: <code>/set_timer 2h</code> | <code>/set_timer 3min</code> | <code>/set_timer 7200</code> | <code>/set_timer off</code>')
         return
     seconds = Tokyo_parse_time(context.args[0])
     if seconds is None:
-        await Tokyo_reply(update, '❌ Invalid time. Example: <code>/set_time 30s</code>, <code>/set_time 3min</code>, <code>/set_time 2h</code> (10s–365d) ya <code>off</code>.')
+        await Tokyo_reply(update, '❌ Invalid time. Example: <code>/set_timer 30s</code>, <code>/set_timer 3min</code>, <code>/set_timer 2h</code> (10s–365d) ya <code>off</code>.')
         return
     Tokyo_set_seconds(chat.id, seconds)
     if seconds:
@@ -542,7 +558,10 @@ async def Tokyo_set_time(update, context):
 async def Tokyo_show_time(update, context):
     chat = update.effective_chat
     seconds = Tokyo_get_seconds(chat.id, chat.type == ChatType.CHANNEL)
-    await Tokyo_reply(update, f'⏱ Current timer: <b>{Tokyo_pretty_time(seconds)}</b>')
+    if seconds:
+        await Tokyo_reply(update, f'⏱ Current timer: <b>{Tokyo_pretty_time(seconds)}</b> ✅')
+    else:
+        await Tokyo_reply(update, '⏱ Current timer: <b>OFF</b> ❌')
 
 
 @Tokyo_fsub_gate
@@ -675,9 +694,10 @@ async def Tokyo_set_pic(update, context):
 async def Tokyo_stats(update, context):
     with closing(Tokyo_connect_db()) as db:
         users = db.execute('SELECT COUNT(*) FROM users').fetchone()[0]
-        chats = db.execute('SELECT COUNT(*) FROM chats WHERE active=1').fetchone()[0]
+        groups = db.execute("SELECT COUNT(*) FROM chats WHERE active=1 AND type IN ('group','supergroup')").fetchone()[0]
+        channels = db.execute("SELECT COUNT(*) FROM chats WHERE active=1 AND type='channel'").fetchone()[0]
         pending = db.execute('SELECT COUNT(*) FROM pending').fetchone()[0]
-    await Tokyo_reply(update, f'📊 <b>Stats</b>\n👤 Users: <b>{users}</b>\n💬 Active groups/channels: <b>{chats}</b>\n🗑 Pending deletions: <b>{pending}</b>\n📢 Force-Sub: {"ON" if Tokyo_fsub_enabled() else "OFF"} ({len(Tokyo_get_fsub_channels())} channel)')
+    await Tokyo_reply(update, f'📊 <b>Stats</b>\n👤 Users: <b>{users}</b>\n💬 Active groups: <b>{groups}</b>\n📢 Active channels: <b>{channels}</b>\n🗑 Pending deletions: <b>{pending}</b>\n📢 Force-Sub: {"ON" if Tokyo_fsub_enabled() else "OFF"} ({len(Tokyo_get_fsub_channels())} channel)')
 
 
 # ───────────────────────── bot added / removed (group + channel) ─────────────────────────
@@ -726,7 +746,7 @@ async def Tokyo_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYP
     if action in ('added', 'promoted') and chat.type in AUTO_TYPES:
         try:
             if new == ChatMemberStatus.ADMINISTRATOR and getattr(event.new_chat_member, 'can_delete_messages', False):
-                text = f'✅ Thanks {Tokyo_mention(adder)}! Ab {"channel me" if chat.type == ChatType.CHANNEL else "yahan"} <code>/set_time 2h</code> se auto-delete timer set karo.'
+                text = f'✅ Thanks {Tokyo_mention(adder)}! Ab {"channel me" if chat.type == ChatType.CHANNEL else "yahan"} <code>/set_timer 2h</code> se auto-delete timer set karo.'
             else:
                 text = f'👋 Thanks {Tokyo_mention(adder)}! Mujhe <b>admin</b> banao (Delete Messages permission) taaki main messages delete kar sakun.'
             text += f'\n\n<i>{CREDIT}</i>'
@@ -741,6 +761,7 @@ async def Tokyo_track_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     message, chat, user = update.effective_message, update.effective_chat, update.effective_user
     if not message or not chat or chat.type not in GROUP_TYPES:
         return
+    Tokyo_touch_chat(context, chat)
     is_bot = bool(user and user.is_bot and user.id not in (ANON_ADMIN_ID, CHANNEL_BOT_ID))
     if is_bot:
         return
@@ -758,10 +779,11 @@ async def Tokyo_track_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def Tokyo_track_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Channel posts are auto-deleted too (bot must be channel admin with Delete Messages). Default OFF until /set_time."""
+    """Channel posts are auto-deleted too (bot must be channel admin with Delete Messages). Default OFF until /set_timer."""
     message, chat = update.effective_message, update.effective_chat
     if not message or not chat or chat.type != ChatType.CHANNEL:
         return
+    Tokyo_touch_chat(context, chat)
     seconds = Tokyo_get_seconds(chat.id, is_channel=True)
     if seconds:
         Tokyo_schedule_delete(chat.id, message.message_id, seconds)
@@ -836,7 +858,7 @@ def Tokyo_build_banner(bot_name, username, bot_id):
         f'   📢 {S("Force-Sub")}  : {S("ON" if Tokyo_fsub_enabled() else "OFF")} ({len(channels)} {S("channel")})',
         f'   📝 {S("Log channel")}: {log_channel or S("not set")}',
         f'   💾 {S("Data")}       : {S(Tokyo_DATA_LABEL[Tokyo_STATE["data"]])}',
-        f'   🗑 {S("Default timer")}: {S(Tokyo_pretty_time(DEFAULT_DELETE_SECONDS))}  |  {S("DB")}: {DB_PATH}',
+        f'   🗑 {S("Auto-delete")}: {S("OFF until an admin sets /set_timer")}  |  {S("DB")}: {DB_PATH}',
         '', f'   🌸 {BRAND}  |  {CREDIT}', '   🔄 ' + S('Restart complete — bot is online & polling Telegram.'), '',
     ])
 
@@ -999,6 +1021,64 @@ async def Tokyo_backup_worker(app):
             log.exception('Tokyo backup worker error')
 
 
+RAM_DAYS = 7
+
+
+def Tokyo_db_healthy():
+    try:
+        with closing(Tokyo_connect_db()) as db:
+            db.execute('SELECT 1 FROM settings LIMIT 1').fetchall()
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def Tokyo_ram_snapshot():
+    folder = tempfile.mkdtemp(prefix='tokyo_ram_')
+    try:
+        with open(Tokyo_make_snapshot(folder), 'rb') as handle:
+            return handle.read()
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def Tokyo_ram_unpack(data):
+    folder = tempfile.mkdtemp(prefix='tokyo_ram_')
+    try:
+        gz_path = os.path.join(folder, BACKUP_NAME)
+        with open(gz_path, 'wb') as handle:
+            handle.write(data)
+        return Tokyo_unpack_backup(gz_path, folder)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+async def Tokyo_ram_check(bot):
+    """Keep one database copy in RAM, replaced by a new one every 7 days (the old one is dropped).
+    If the database file is lost/emptied while the bot is running, bring it back from that copy."""
+    ram = Tokyo_STATE['ram']
+    if ram and not Tokyo_db_healthy():
+        if await asyncio.to_thread(Tokyo_ram_unpack, ram[1]):
+            Tokyo_init_db()
+            log.warning('Database was missing - restored from the RAM copy.')
+            await Tokyo_send_log(types.SimpleNamespace(bot=bot), '♻️ <b>Database Restored From RAM Copy</b>\nDatabase file gone mila, RAM backup se wapas laaya gaya.')
+        return
+    if ram is None or time.time() - ram[0] >= RAM_DAYS * 86400:
+        data = await asyncio.to_thread(Tokyo_ram_snapshot)
+        Tokyo_STATE['ram'], old = (time.time(), data), Tokyo_STATE['ram']
+        del old   # the previous copy is released from RAM
+        log.info('RAM database copy refreshed (%d KB).', len(data) // 1024)
+
+
+async def Tokyo_ram_worker(app):
+    while True:
+        try:
+            await Tokyo_ram_check(app.bot)
+        except Exception:
+            log.exception('Tokyo RAM backup error')
+        await asyncio.sleep(30)
+
+
 async def Tokyo_post_stop(app):
     """Graceful shutdown (redeploy / SIGTERM): save the very latest data before the host wipes the disk."""
     if not BACKUP_TO_LOG or Tokyo_STATE['conflict']:
@@ -1010,7 +1090,7 @@ async def Tokyo_post_stop(app):
 
 
 async def Tokyo_post_shutdown(app):
-    for name in ('worker', 'backup_worker'):
+    for name in ('worker', 'backup_worker', 'ram_worker'):
         task = app.bot_data.get(name)
         if task:
             task.cancel()
@@ -1026,7 +1106,7 @@ def Tokyo_cmd(name, description):
 async def Tokyo_post_init(app):
     Tokyo_STATE['lock'] = asyncio.Lock()
     user_cmds = [Tokyo_cmd('start', 'Start the bot'), Tokyo_cmd('help', 'Help & commands'),
-                 Tokyo_cmd('set_time', 'Set auto-delete time (admins)'), Tokyo_cmd('show_time', 'Show current timer'),
+                 Tokyo_cmd('set_timer', 'Set auto-delete time (admins)'), Tokyo_cmd('show_time', 'Show current timer'),
                  Tokyo_cmd('get_id', 'Show chat / user ID')]
     owner_cmds = user_cmds + [Tokyo_cmd('add_fsub', 'Add force-sub channel ID'), Tokyo_cmd('remove_fsub', 'Remove force-sub channel'),
                               Tokyo_cmd('list_fsub', 'List force-sub channels'), Tokyo_cmd('set_fsub', 'Force-sub on/off'),
@@ -1050,6 +1130,7 @@ async def Tokyo_post_init(app):
     Tokyo_STATE['dirty'] = bool(BACKUP_TO_LOG) and Tokyo_STATE['data'] != 'restored'
     loop = asyncio.get_running_loop()
     app.bot_data['worker'] = loop.create_task(Tokyo_deletion_worker(app))
+    app.bot_data['ram_worker'] = loop.create_task(Tokyo_ram_worker(app))
     if BACKUP_TO_LOG:
         app.bot_data['backup_worker'] = loop.create_task(Tokyo_backup_worker(app))
     app.bot_data['health'] = await Tokyo_health_server()
@@ -1074,7 +1155,7 @@ def Tokyo_main():
            .post_init(Tokyo_post_init).post_stop(Tokyo_post_stop).post_shutdown(Tokyo_post_shutdown).build())
     handlers = [
         ('start', Tokyo_start), ('help', Tokyo_help),
-        ('set_time', Tokyo_set_time), ('show_time', Tokyo_show_time), ('get_id', Tokyo_get_id),
+        ('set_timer', Tokyo_set_timer), ('set_time', Tokyo_set_timer), ('show_time', Tokyo_show_time), ('get_id', Tokyo_get_id),
         ('add_fsub', Tokyo_add_fsub), ('remove_fsub', Tokyo_remove_fsub), ('list_fsub', Tokyo_list_fsub),
         ('set_fsub', Tokyo_set_fsub), ('set_log', Tokyo_set_log), ('set_pic', Tokyo_set_pic), ('stats', Tokyo_stats),
     ]
