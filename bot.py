@@ -781,26 +781,25 @@ async def Tokyo_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ───────────────────────── message tracking / auto delete ─────────────────────────
 async def Tokyo_track_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-message, chat, user = update.effective_message, update.effective_chat, update.effective_user
-if not message or not chat or chat.type not in GROUP_TYPES:
-return
+    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not message or not chat or chat.type not in GROUP_TYPES:
+        return
 
-Tokyo_touch_chat(context, chat)
+    Tokyo_touch_chat(context, chat)
 
-is_bot = bool(user and user.is_bot and user.id not in (ANON_ADMIN_ID, CHANNEL_BOT_ID))
-if is_bot:
-    return
+    is_bot = bool(user and user.is_bot and user.id not in (ANON_ADMIN_ID, CHANNEL_BOT_ID))
+    if is_bot:
+        return
 
-is_command = bool(message.text and message.text.startswith('/'))
-is_service = bool(filters.StatusUpdate.ALL.check_update(update))
-anonymous = message.sender_chat is not None or (user and user.id in (ANON_ADMIN_ID, CHANNEL_BOT_ID))
+    is_command = bool(message.text and message.text.startswith('/'))
+    is_service = bool(filters.StatusUpdate.ALL.check_update(update))
+    anonymous = message.sender_chat is not None or (user and user.id in (ANON_ADMIN_ID, CHANNEL_BOT_ID))
 
-# Fsub check is handled by command decorators only.
-# Normal messages must not trigger force-sub.
-seconds = Tokyo_get_seconds(chat.id)
-if seconds and not is_service:
-    Tokyo_schedule_delete(chat.id, message.message_id, seconds)
-
+    # Fsub check is handled by command decorators only.
+    # Normal messages must not trigger force-sub.
+    seconds = Tokyo_get_seconds(chat.id)
+    if seconds:
+        Tokyo_schedule_delete(chat.id, message.message_id, seconds)
 
 async def Tokyo_track_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Channel posts are auto-deleted too (bot must be channel admin with Delete Messages). Default OFF until /set_timer."""
