@@ -294,34 +294,57 @@ async def Tokyo_reply(update, text, markup=None, temp=True):
 
 # ───────────────────────── force-sub core ─────────────────────────
 async def Tokyo_missing_channels(context, user_id, force=False):
-    """Channels (global list) the user has NOT joined. Owners are always exempt."""
+    """Check every force-sub channel on every request. Recheck immediately after leaving."""
     if user_id in OWNER_IDS or not Tokyo_fsub_enabled():
         return []
+
     channels = Tokyo_get_fsub_channels()
     if not channels:
         return []
-    cache = context.bot_data.setdefault('fsub_ok', {})
-    if not force and cache.get(user_id, 0) > time.time():
-        return []
+
     missing = []
+
     for channel in channels:
         try:
-            member = await context.bot.get_chat_member(channel['id'], user_id)
-            joined = member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER) \
-                or (member.status == ChatMemberStatus.RESTRICTED and member.is_member)
+            member = await context.bot.get_chat_member(
+                channel['id'], user_id
+            )
+
+            joined = (
+                member.status in (
+                    ChatMemberStatus.MEMBER,
+                    ChatMemberStatus.ADMINISTRATOR,
+                    ChatMemberStatus.OWNER
+                )
+                or (
+                    member.status == ChatMemberStatus.RESTRICTED
+                    and member.is_member
+                )
+            )
+
             if not joined:
                 missing.append(channel)
+
         except TelegramError as error:
-            # Bot can't check this channel (removed / not admin). Don't lock everyone out; tell the owner instead.
-            log.warning('Force-sub check failed for %s: %s', channel['id'], error)
+            log.warning(
+                'Force-sub check failed for %s: %s',
+                channel['id'], error
+            )
+
             last = context.bot_data.setdefault('fsub_alert', {})
+
             if last.get(channel['id'], 0) < time.time() - 3600:
                 last[channel['id']] = time.time()
-                await Tokyo_send_log(context, f'⚠️ <b>Force-Sub problem</b>\nChannel <code>{channel["id"]}</code> ({Tokyo_d(channel["title"] or "")}) check nahi ho pa raha.\nBot ko us channel me admin banao.\n<code>{html.escape(str(error))}</code>')
-    if not missing:
-        if len(cache) > 5000:
-            cache.clear()
-        cache[user_id] = time.time() + 120
+
+                await Tokyo_send_log(
+                    context,
+                    f'⚠️ <b>Force-Sub problem</b>\n'
+                    f'Channel <code>{channel["id"]}</code> '
+                    f'({Tokyo_d(channel["title"] or "")}) check nahi ho pa raha.\n'
+                    f'Bot ko us channel me admin banao.\n'
+                    f'<code>{html.escape(str(error))}</code>'
+                )
+
     return missing
 
 
@@ -462,7 +485,7 @@ def Tokyo_help_text(user_id):
     if user_id in OWNER_IDS:
         text += ('\n\n👑 <b>Owner:</b>\n'
                  '• <code>/add_fsub -1001234567890</code>\n• <code>/remove_fsub -1001234567890</code>\n• /list_fsub\n• <code>/set_fsub on</code> | <code>/set_fsub off</code>\n'
-                 '• <code>/set_log -1001234567890</code> | <code>/set_log off</code>\n• /set_pic (photo par reply)\n• /stats\n\n' + CREDIT)
+                 '• <code>/set_log -1001234567890</code> | <code>/set_log off</code>\n• /set_pic (photo par reply)\n• /stats')
     return text
 
 
