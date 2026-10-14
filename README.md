@@ -44,6 +44,17 @@ Add the bot as admin in a channel and run `/set_log <channel id>`. It logs:
 - Bot added / removed / promoted in a group or channel: **who did it** (name, username, ID) and the group/channel name, username, ID, type, member count, delete permission
 - Force-Sub changes and Force-Sub problems
 
+## Restart: settings & timers stay
+Many hosts (Render free, Koyeb, Heroku, Railway without a volume...) wipe the disk on every restart/redeploy, which used to reset every timer to the default.
+Now the bot keeps a **backup of its database in the log channel** (one pinned file, `tokyo_backup.sqlite3.gz`) and restores it automatically when it starts with an empty disk.
+- Needs: a log channel (`LOG_CHANNEL` env / `info.py`, or `/set_log`) and the bot as **admin** there with **Post Messages** + **Pin Messages** (channels: **Edit Messages**). Don't pin other messages in that channel.
+- Backups run ~30 s after any change (timer, force-sub, log channel, bot added/removed) and once more on a graceful shutdown.
+- On every start the log channel gets **🔄 Bot Restarted** (with *restored from backup / loaded from disk / fresh start*), and the console banner says **BOT RESTARTED**.
+- If your host has a persistent disk, mount it and set `DB_PATH` to it (then the backup is just a safety copy). `BACKUP_TO_LOG=0` turns the backup off.
+
+## Output style
+All bot messages, buttons and command descriptions are shown in **small caps**. Commands, `<code>` examples, @usernames, links and chat/channel names are left as they are. `/set_time` and `/set_log` replies no longer show the chat name.
+
 ## Pictures
 - `assets/start.jpg` is the `/start` banner (1280×720). Replace the file, set `START_PIC`, or use `/set_pic`.
 - `assets/bot_profile.jpg` is a ready bot profile picture: upload it in **@BotFather → /setuserpic**.
