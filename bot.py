@@ -77,9 +77,11 @@ class Tokyo_SafeFormatter(logging.Formatter):
         return Tokyo_TOKEN_RE.sub('<BOT_TOKEN_HIDDEN>', super().format(record))
 
 
-Tokyo_STATE = {'ram': None, 'conflict': False, 'dirty': False, 'fresh_db': False, 'backup_msg': None, 'data': 'disk', 'pin_warned': 0, 'lock': None}
+Tokyo_STATE = {'ram': None, 'conflict': False, 'dirty': False, 'fresh_db': False, 'recovery_pending': False, 'backup_msg': None, 'data': 'disk', 'pin_warned': 0, 'lock': None, 'last_backup': 0.0, 'last_change': 0.0}
 BACKUP_NAME = 'tokyo_backup.sqlite3.gz'
-BACKUP_MIN_GAP = 30        # seconds between two backups (changes are batched)
+BACKUP_INTERVAL = 3 * 24 * 60 * 60  # scheduled safety backup every 3 days when no changes occur
+BACKUP_DEBOUNCE = 2                 # combine rapid database writes into one backup
+BACKUP_MIN_GAP = 15                 # avoid Telegram upload spam during busy chats
 Tokyo_DATA_LABEL = {'restored': 'Settings restored from backup ✅', 'disk': 'Settings loaded from disk ✅',
                     'fresh': 'Fresh start (no backup found) 🆕'}
 
@@ -141,13 +143,14 @@ def Tokyo_touch_chat(context, chat):
                       ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, username=excluded.username, type=excluded.type, active=1''',
                    (chat.id, chat.title, chat.username, chat.type, int(time.time())))
         db.commit()
-    if not row or not row[0]:
-        Tokyo_mark_dirty()
+    # This upsert may update a chat title/username even when the chat already existed.
+    Tokyo_mark_dirty()
 
 
 def Tokyo_mark_dirty():
-    """Something changed -> the backup worker uploads a fresh backup to the log channel."""
+    """Mark the committed DB as changed; the worker refreshes RAM and Log Channel backups."""
     Tokyo_STATE['dirty'] = True
+    Tokyo_STATE['last_change'] = time.time()
 
 
 def Tokyo_get_config(key, default=None):
@@ -203,6 +206,7 @@ def Tokyo_schedule_delete(chat_id, message_id, seconds):
     with closing(Tokyo_connect_db()) as db:
         db.execute('INSERT OR REPLACE INTO pending(chat_id,message_id,delete_at) VALUES(?,?,?)', (chat_id, message_id, int(time.time()) + int(seconds)))
         db.commit()
+    Tokyo_mark_dirty()
 
 
 def Tokyo_upsert_user(user):
@@ -214,8 +218,8 @@ def Tokyo_upsert_user(user):
                       ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, username=excluded.username, last_seen=excluded.last_seen''',
                    (user.id, user.full_name, user.username, now, now))
         db.commit()
-    if not exists:
-        Tokyo_mark_dirty()
+    # User profile/last_seen is persisted too; backup worker coalesces rapid updates.
+    Tokyo_mark_dirty()
     return not exists
 
 
@@ -225,6 +229,8 @@ def Tokyo_mark_started(user):
     with closing(Tokyo_connect_db()) as db:
         changed = db.execute('UPDATE users SET started=1 WHERE user_id=? AND started=0', (user.id,)).rowcount
         db.commit()
+    if changed:
+        Tokyo_mark_dirty()
     return bool(changed)
 
 
@@ -294,57 +300,34 @@ async def Tokyo_reply(update, text, markup=None, temp=True):
 
 # ───────────────────────── force-sub core ─────────────────────────
 async def Tokyo_missing_channels(context, user_id, force=False):
-    """Check every force-sub channel on every request. Recheck immediately after leaving."""
+    """Channels (global list) the user has NOT joined. Owners are always exempt."""
     if user_id in OWNER_IDS or not Tokyo_fsub_enabled():
         return []
-
     channels = Tokyo_get_fsub_channels()
     if not channels:
         return []
-
+    cache = context.bot_data.setdefault('fsub_ok', {})
+    if not force and cache.get(user_id, 0) > time.time():
+        return []
     missing = []
-
     for channel in channels:
         try:
-            member = await context.bot.get_chat_member(
-                channel['id'], user_id
-            )
-
-            joined = (
-                member.status in (
-                    ChatMemberStatus.MEMBER,
-                    ChatMemberStatus.ADMINISTRATOR,
-                    ChatMemberStatus.OWNER
-                )
-                or (
-                    member.status == ChatMemberStatus.RESTRICTED
-                    and member.is_member
-                )
-            )
-
+            member = await context.bot.get_chat_member(channel['id'], user_id)
+            joined = member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER) \
+                or (member.status == ChatMemberStatus.RESTRICTED and member.is_member)
             if not joined:
                 missing.append(channel)
-
         except TelegramError as error:
-            log.warning(
-                'Force-sub check failed for %s: %s',
-                channel['id'], error
-            )
-
+            # Bot can't check this channel (removed / not admin). Don't lock everyone out; tell the owner instead.
+            log.warning('Force-sub check failed for %s: %s', channel['id'], error)
             last = context.bot_data.setdefault('fsub_alert', {})
-
             if last.get(channel['id'], 0) < time.time() - 3600:
                 last[channel['id']] = time.time()
-
-                await Tokyo_send_log(
-                    context,
-                    f'⚠️ <b>Force-Sub problem</b>\n'
-                    f'Channel <code>{channel["id"]}</code> '
-                    f'({Tokyo_d(channel["title"] or "")}) check nahi ho pa raha.\n'
-                    f'Bot ko us channel me admin banao.\n'
-                    f'<code>{html.escape(str(error))}</code>'
-                )
-
+                await Tokyo_send_log(context, f'⚠️ <b>Force-Sub problem</b>\nChannel <code>{channel["id"]}</code> ({Tokyo_d(channel["title"] or "")}) check nahi ho pa raha.\nBot ko us channel me admin banao.\n<code>{html.escape(str(error))}</code>')
+    if not missing:
+        if len(cache) > 5000:
+            cache.clear()
+        cache[user_id] = time.time() + 120
     return missing
 
 
@@ -485,7 +468,7 @@ def Tokyo_help_text(user_id):
     if user_id in OWNER_IDS:
         text += ('\n\n👑 <b>Owner:</b>\n'
                  '• <code>/add_fsub -1001234567890</code>\n• <code>/remove_fsub -1001234567890</code>\n• /list_fsub\n• <code>/set_fsub on</code> | <code>/set_fsub off</code>\n'
-                 '• <code>/set_log -1001234567890</code> | <code>/set_log off</code>\n• /set_pic (photo par reply)\n• /stats')
+                 '• <code>/set_log -1001234567890</code> | <code>/set_log off</code>\n• /set_pic (photo par reply)\n• /stats\n\n' + CREDIT)
     return text
 
 
@@ -784,22 +767,22 @@ async def Tokyo_track_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     message, chat, user = update.effective_message, update.effective_chat, update.effective_user
     if not message or not chat or chat.type not in GROUP_TYPES:
         return
-
     Tokyo_touch_chat(context, chat)
-
     is_bot = bool(user and user.is_bot and user.id not in (ANON_ADMIN_ID, CHANNEL_BOT_ID))
     if is_bot:
         return
-
     is_command = bool(message.text and message.text.startswith('/'))
     is_service = bool(filters.StatusUpdate.ALL.check_update(update))
     anonymous = message.sender_chat is not None or (user and user.id in (ANON_ADMIN_ID, CHANNEL_BOT_ID))
-
-    # Fsub check is handled by command decorators only.
-    # Normal messages must not trigger force-sub.
+    if user and not anonymous and not is_command and not is_service:
+        missing = await Tokyo_missing_channels(context, user.id)
+        if missing:
+            await Tokyo_join_prompt(update, context, missing)
+            return
     seconds = Tokyo_get_seconds(chat.id)
     if seconds:
         Tokyo_schedule_delete(chat.id, message.message_id, seconds)
+
 
 async def Tokyo_track_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Channel posts are auto-deleted too (bot must be channel admin with Delete Messages). Default OFF until /set_timer."""
@@ -828,6 +811,7 @@ async def Tokyo_deletion_worker(app):
                 with closing(Tokyo_connect_db()) as db:
                     db.execute('DELETE FROM pending WHERE chat_id=? AND message_id=?', (chat_id, message_id))
                     db.commit()
+                Tokyo_mark_dirty()
         except Exception:
             log.exception('Tokyo deletion worker error')
         await asyncio.sleep(CHECK_INTERVAL)
@@ -1030,16 +1014,51 @@ async def Tokyo_backup_now(bot):
 
 
 async def Tokyo_backup_worker(app):
-    last = 0.0
+    """Keep a fresh in-process RAM copy after changes, upload coalesced changes to Telegram,
+    and create a safety backup every three days even when the bot is idle."""
     while True:
-        await asyncio.sleep(10)
+        await asyncio.sleep(2)
         try:
-            if Tokyo_STATE['dirty'] and time.time() - last >= BACKUP_MIN_GAP:
+            if Tokyo_STATE['recovery_pending']:
+                continue  # never overwrite the last good remote backup before the owner chooses
+
+            now = time.time()
+            changed = Tokyo_STATE['dirty'] and now - Tokyo_STATE['last_change'] >= BACKUP_DEBOUNCE
+            scheduled = now - Tokyo_STATE['last_backup'] >= BACKUP_INTERVAL
+            ram = Tokyo_STATE.get('ram')
+            ram_needs_refresh = changed and (ram is None or ram[0] < Tokyo_STATE['last_change'])
+            remote_due = changed and now - Tokyo_STATE['last_backup'] >= BACKUP_MIN_GAP
+            if not ram_needs_refresh and not scheduled and not remote_due:
+                continue
+
+            # Snapshot first: RAM recovery is refreshed even if Telegram upload is unavailable.
+            if ram_needs_refresh or scheduled:
+                try:
+                    snapshot_change_time = Tokyo_STATE['last_change'] if changed else time.time()
+                    data = await asyncio.to_thread(Tokyo_ram_snapshot)
+                    Tokyo_STATE['ram'] = (snapshot_change_time, data)
+                    log.info('RAM backup refreshed (%d KB; reason: %s).', len(data) // 1024,
+                             'database changed' if changed else '3-day schedule')
+                except Exception:
+                    log.exception('RAM backup refresh failed')
+
+            # For rapid changes, upload only after the short quiet window and minimum gap.
+            if BACKUP_TO_LOG and (scheduled or remote_due):
                 Tokyo_STATE['dirty'] = False
                 result = await Tokyo_backup_now(app.bot)
-                last = time.time()
-                if result is False:
-                    Tokyo_STATE['dirty'] = True   # try again after the gap
+                if result is True:
+                    Tokyo_STATE['last_backup'] = time.time()
+                    log.info('Log Channel backup updated (%s).', 'database changed' if changed else '3-day scheduled backup')
+                elif result is False:
+                    Tokyo_STATE['dirty'] = True
+                    log.warning('Log Channel backup failed; it will retry.')
+                # None means remote backups are disabled or no log channel is configured.
+            else:
+                # RAM is current; retain dirty state until remote upload is permitted.
+                if not BACKUP_TO_LOG:
+                    Tokyo_STATE['dirty'] = False
+        except asyncio.CancelledError:
+            raise
         except Exception:
             log.exception('Tokyo backup worker error')
 
@@ -1050,8 +1069,12 @@ RAM_DAYS = 7
 def Tokyo_db_healthy():
     try:
         with closing(Tokyo_connect_db()) as db:
-            db.execute('SELECT 1 FROM settings LIMIT 1').fetchall()
-        return True
+            result = db.execute('PRAGMA integrity_check').fetchone()
+            if not result or result[0] != 'ok':
+                return False
+            required = {'settings', 'pending', 'config', 'fsub_channels', 'users', 'chats'}
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            return required.issubset(tables)
     except sqlite3.Error:
         return False
 
@@ -1077,28 +1100,18 @@ def Tokyo_ram_unpack(data):
 
 
 async def Tokyo_ram_check(bot):
-    """Keep the latest database snapshot in RAM and restore if database is lost."""
-    try:
-        data = await asyncio.to_thread(Tokyo_ram_snapshot)
-        old = Tokyo_STATE.get('ram')
-        Tokyo_STATE['ram'] = (time.time(), data)
-
-        if old:
-            del old
-
-        log.info('RAM backup refreshed (%d KB).', len(data) // 1024)
-
-        if not Tokyo_db_healthy():
-            ram = Tokyo_STATE.get('ram')
-            if ram and await asyncio.to_thread(Tokyo_ram_unpack, ram[1]):
-                Tokyo_init_db()
-                log.warning('Database restored from RAM backup.')
-                await Tokyo_send_log(
-                    types.SimpleNamespace(bot=bot),
-                    '♻️ <b>Database Restored From RAM Backup</b>'
-                )
-    except Exception:
-        log.exception('RAM backup failed')
+    """Restore a damaged runtime DB from the last valid RAM snapshot; never snapshot corruption."""
+    if not Tokyo_db_healthy():
+        ram = Tokyo_STATE['ram']
+        if ram and await asyncio.to_thread(Tokyo_ram_unpack, ram[1]):
+            Tokyo_init_db()
+            Tokyo_STATE['dirty'] = True
+            Tokyo_STATE['last_change'] = time.time()
+            log.warning('Database integrity failed; restored from the in-process RAM backup.')
+            await Tokyo_send_log(types.SimpleNamespace(bot=bot),
+                                 '♻️ <b>Database Restored From RAM Backup</b>\nDamaged database ko last valid RAM backup se restore kiya gaya.')
+        else:
+            log.error('Database integrity failed and no usable RAM backup is available.')
 
 
 async def Tokyo_ram_worker(app):
@@ -1111,23 +1124,22 @@ async def Tokyo_ram_worker(app):
 
 
 async def Tokyo_post_stop(app):
-    """Save the latest database backup during graceful shutdown."""
-    if not BACKUP_TO_LOG or Tokyo_STATE['conflict']:
+    """On graceful shutdown, refresh RAM and save the latest valid remote backup."""
+    if Tokyo_STATE['conflict'] or Tokyo_STATE['recovery_pending']:
         return
-
     try:
-        data = await asyncio.to_thread(Tokyo_ram_snapshot)
+        data = await asyncio.wait_for(asyncio.to_thread(Tokyo_ram_snapshot), timeout=20)
         Tokyo_STATE['ram'] = (time.time(), data)
-
-        await asyncio.wait_for(
-            Tokyo_backup_now(app.bot),
-            timeout=25
-        )
-
-        log.info('Final RAM and log-channel backup completed.')
-
     except Exception:
-        log.exception('Final shutdown backup failed')
+        log.exception('Final RAM backup on shutdown failed')
+    if BACKUP_TO_LOG:
+        try:
+            result = await asyncio.wait_for(Tokyo_backup_now(app.bot), timeout=25)
+            if result is True:
+                Tokyo_STATE['last_backup'] = time.time()
+                log.info('Final Log Channel backup saved before shutdown.')
+        except Exception:
+            log.warning('Final Log Channel backup on shutdown failed')
 
 
 async def Tokyo_post_shutdown(app):
@@ -1138,6 +1150,70 @@ async def Tokyo_post_shutdown(app):
     server = app.bot_data.get('health')
     if server:
         server.close()
+        try:
+            await server.wait_closed()
+        except Exception:
+            pass
+
+
+async def Tokyo_recovery_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    if user.id not in OWNER_IDS:
+        await query.answer('Only the bot owner can use recovery controls.', show_alert=True)
+        return
+    action = query.data
+    await query.answer('Recovery request received…')
+
+    if action == 'recover_ram':
+        ram = Tokyo_STATE.get('ram')
+        if not ram:
+            await query.edit_message_text('❌ Is process me RAM backup available nahi hai. Log Channel backup use karo.')
+            return
+        ok = await asyncio.to_thread(Tokyo_ram_unpack, ram[1])
+        if not ok:
+            await query.edit_message_text('❌ RAM backup damaged hai; Log Channel restore try karo.')
+            return
+        Tokyo_init_db()
+        Tokyo_STATE['recovery_pending'] = False
+        Tokyo_STATE['fresh_db'] = False
+        Tokyo_STATE['data'] = 'restored'
+        Tokyo_STATE['dirty'] = True
+        Tokyo_STATE['last_change'] = time.time()
+        await query.edit_message_text('✅ Database RAM backup se restore ho gaya. Log Channel backup bhi update hoga.')
+        return
+
+    if action == 'recover_log':
+        ok = await Tokyo_restore_backup(context.bot)
+        if not ok:
+            await query.edit_message_text('❌ Log Channel backup restore nahi hua. Backup pinned hai aur valid hai ya nahi check karo; phir dobara try karo.')
+            return
+        Tokyo_STATE['recovery_pending'] = False
+        Tokyo_STATE['fresh_db'] = False
+        Tokyo_STATE['data'] = 'restored'
+        try:
+            data = await asyncio.to_thread(Tokyo_ram_snapshot)
+            Tokyo_STATE['ram'] = (time.time(), data)
+        except Exception:
+            log.exception('RAM snapshot after log restore failed')
+        await query.edit_message_text('✅ Database Log Channel backup se restore ho gaya. RAM backup bhi refresh kar diya gaya.')
+        if BACKUP_TO_LOG:
+            Tokyo_STATE['dirty'] = True
+            Tokyo_STATE['last_change'] = time.time()
+        return
+
+    if action == 'recover_fresh':
+        Tokyo_STATE['recovery_pending'] = False
+        Tokyo_STATE['fresh_db'] = False
+        Tokyo_STATE['data'] = 'fresh'
+        try:
+            data = await asyncio.to_thread(Tokyo_ram_snapshot)
+            Tokyo_STATE['ram'] = (time.time(), data)
+        except Exception:
+            log.exception('RAM snapshot for fresh database failed')
+        Tokyo_STATE['dirty'] = True
+        Tokyo_STATE['last_change'] = time.time()
+        await query.edit_message_text('🆕 Fresh database select kar liya. Purane Log Channel backup ko ab latest fresh backup replace karega.')
 
 
 def Tokyo_cmd(name, description):
@@ -1158,39 +1234,108 @@ async def Tokyo_post_init(app):
             try:
                 await app.bot.set_my_commands(owner_cmds, scope=BotCommandScopeChat(owner_id))
             except TelegramError:
-                pass  # owner hasn't started the bot yet
+                pass
     except TelegramError as error:
         log.warning('set_my_commands failed: %s', error)
-    # Host wiped the disk (fresh database)? Bring the settings back from the log-channel backup BEFORE anything runs.
-    if BACKUP_TO_LOG and Tokyo_STATE['fresh_db'] and await Tokyo_restore_backup(app.bot):
-        Tokyo_STATE['data'] = 'restored'
+
+    if BACKUP_TO_LOG:
+        _, Tokyo_STATE['backup_msg'] = await Tokyo_find_backup(app.bot)
+
+    # Missing/corrupt database: don't silently restore or overwrite the only good backup.
+    # Ask the owner to choose Log Channel restore or Fresh Start. RAM is offered only if truly available.
+    if Tokyo_STATE['fresh_db']:
+        Tokyo_STATE['recovery_pending'] = True
+        Tokyo_STATE['data'] = 'fresh'
+        rows = [[InlineKeyboardButton('♻️ Restore Log Channel Backup', callback_data='recover_log')],
+                [InlineKeyboardButton('🆕 Start Fresh (replace old backup)', callback_data='recover_fresh')]]
+        if Tokyo_STATE.get('ram'):
+            rows.insert(0, [InlineKeyboardButton('🧠 Restore RAM Backup', callback_data='recover_ram')])
+        markup = InlineKeyboardMarkup(rows)
+        notice = ('⚠️ <b>Database Recovery Needed</b>\n\nDatabase file missing/corrupt mila hai. Backup overwrite karne se pehle option select karo. '
+                  'Actual process restart ke baad RAM backup normally available nahi hota; isliye Log Channel restore recommended hai.\n\n'
+                  '<i>Tokyo_Updates</i>')
+        delivered = False
+        for owner_id in OWNER_IDS:
+            try:
+                await app.bot.send_message(owner_id, Tokyo_sc(notice), parse_mode=HTML, reply_markup=markup)
+                delivered = True
+            except TelegramError as error:
+                log.warning('Recovery prompt could not be sent to owner %s: %s', owner_id, error)
+        if not delivered and Tokyo_get_log_channel():
+            try:
+                await app.bot.send_message(Tokyo_get_log_channel(), Tokyo_sc(notice), parse_mode=HTML, reply_markup=markup)
+                delivered = True
+            except TelegramError as error:
+                log.error('Recovery prompt could not be sent to Log Channel: %s', error)
+        log.warning('Database recovery is pending owner choice; automatic backup uploads are paused.')
     else:
-        Tokyo_STATE['data'] = 'fresh' if Tokyo_STATE['fresh_db'] else 'disk'
+        Tokyo_STATE['data'] = 'disk'
+        try:
+            ram_data = await asyncio.to_thread(Tokyo_ram_snapshot)
+            Tokyo_STATE['ram'] = (time.time(), ram_data)
+            log.info('Immediate RAM backup created (%d KB).', len(ram_data) // 1024)
+        except Exception:
+            log.exception('Immediate RAM backup failed')
         if BACKUP_TO_LOG:
-            _, Tokyo_STATE['backup_msg'] = await Tokyo_find_backup(app.bot)   # so the next backup replaces the old one
-    Tokyo_STATE['dirty'] = bool(BACKUP_TO_LOG) and Tokyo_STATE['data'] != 'restored'
+            try:
+                backup_result = await asyncio.wait_for(Tokyo_backup_now(app.bot), timeout=45)
+                if backup_result is True:
+                    Tokyo_STATE['last_backup'] = time.time()
+                    Tokyo_STATE['dirty'] = False
+                    log.info('Immediate startup backup saved to the Log Channel.')
+                else:
+                    Tokyo_STATE['dirty'] = True
+                    Tokyo_STATE['last_change'] = time.time()
+                    log.warning('Immediate startup Log Channel backup was not saved; worker will retry.')
+            except Exception:
+                Tokyo_STATE['dirty'] = True
+                Tokyo_STATE['last_change'] = time.time()
+                log.exception('Immediate startup backup failed; worker will retry')
+        else:
+            Tokyo_STATE['last_backup'] = time.time()
+
     loop = asyncio.get_running_loop()
     app.bot_data['worker'] = loop.create_task(Tokyo_deletion_worker(app))
     app.bot_data['ram_worker'] = loop.create_task(Tokyo_ram_worker(app))
-    if BACKUP_TO_LOG:
-        app.bot_data['backup_worker'] = loop.create_task(Tokyo_backup_worker(app))
+    app.bot_data['backup_worker'] = loop.create_task(Tokyo_backup_worker(app))
     app.bot_data['health'] = await Tokyo_health_server()
     try:
         print(Tokyo_build_banner(app.bot.first_name, app.bot.username, app.bot.id), flush=True)
-        log.info('🔄 Bot restarted | data: %s', Tokyo_STATE['data'])
+        log.info('🔄 Bot restarted | data: %s', Tokyo_DATA_LABEL[Tokyo_STATE['data']])
         when = datetime.now(timezone.utc).strftime('%d %b %Y, %H:%M UTC')
         await Tokyo_send_log(types.SimpleNamespace(bot=app.bot),
                              f'🔄 <b>Bot Restarted</b>\n🤖 @{app.bot.username}\n🌸 {BRAND}\n💾 {Tokyo_DATA_LABEL[Tokyo_STATE["data"]]}\n🕒 {when}')
     except Exception:
         log.exception('Startup banner failed')
     if not OWNER_IDS:
-        log.warning('OWNER_IDS is empty: nobody can use owner commands (fsub / log / pic). Set OWNER_IDS env.')
+        log.warning('OWNER_IDS is empty: nobody can use owner commands (fsub / log / pic / recovery). Set OWNER_IDS env.')
 
 
 def Tokyo_main():
     if not BOT_TOKEN:
         raise RuntimeError('BOT_TOKEN missing. Set it in environment variables; do not upload your token to GitHub.')
-    Tokyo_STATE['fresh_db'] = not os.path.exists(DB_PATH)   # missing file = host wiped the disk -> restore from the log channel
+    Tokyo_STATE['fresh_db'] = not os.path.exists(DB_PATH)
+    if os.path.exists(DB_PATH):
+        try:
+            with closing(sqlite3.connect(DB_PATH, timeout=10)) as check_db:
+                result = check_db.execute('PRAGMA integrity_check').fetchone()
+                if not result or result[0] != 'ok':
+                    raise sqlite3.DatabaseError(str(result[0] if result else 'integrity check failed'))
+        except sqlite3.Error as error:
+            stamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+            damaged_path = f'{DB_PATH}.corrupt_{stamp}'
+            try:
+                os.replace(DB_PATH, damaged_path)
+                log.error('Database corrupt (%s); preserved damaged file as %s', error, damaged_path)
+            except OSError:
+                log.exception('Could not quarantine corrupt database file')
+                raise
+            for suffix in ('-wal', '-shm'):
+                try:
+                    os.remove(DB_PATH + suffix)
+                except FileNotFoundError:
+                    pass
+            Tokyo_STATE['fresh_db'] = True
     Tokyo_init_db()
     app = (Application.builder().token(BOT_TOKEN).concurrent_updates(True)
            .post_init(Tokyo_post_init).post_stop(Tokyo_post_stop).post_shutdown(Tokyo_post_shutdown).build())
@@ -1202,6 +1347,7 @@ def Tokyo_main():
     ]
     for command, callback in handlers:
         app.add_handler(CommandHandler(command, callback, filters=filters.UpdateType.MESSAGE | filters.UpdateType.CHANNEL_POST))
+    app.add_handler(CallbackQueryHandler(Tokyo_recovery_cb, pattern='^recover_(ram|log|fresh)$'))
     app.add_handler(CallbackQueryHandler(Tokyo_verify_cb, pattern='^fsub_verify$'))
     app.add_handler(CallbackQueryHandler(Tokyo_menu_cb, pattern='^(help|home)$'))
     app.add_handler(ChatMemberHandler(Tokyo_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
